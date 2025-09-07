@@ -604,9 +604,12 @@ func (ui *ConsoleUI) bindKeys() {
 		case tcell.KeyRune:
 			switch ev.Rune() {
 			case 'q', 'Q':
-				// ALWAYS exit (regardless of focus)
-				exitNow(0)
-				return nil
+				// Exit only when NOT typing in the input field
+				if ui.app.GetFocus() != ui.inputField {
+					exitNow(0)
+					return nil
+				}
+				return ev // allow typing q/Q in input
 
 			case '/':
 				ui.app.SetFocus(ui.inputField)
@@ -614,7 +617,7 @@ func (ui *ConsoleUI) bindKeys() {
 				return nil
 
 			case 'm':
-				// Only toggle mouse when NOT typing in the input
+				// Toggle mouse only when NOT in the input field
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
 					ui.mouseOn = !ui.mouseOn
@@ -627,7 +630,7 @@ func (ui *ConsoleUI) bindKeys() {
 				return ev // allow typing 'm' in input
 
 			case 'c', 'C':
-				// Only toggle case when NOT typing in the input
+				// Toggle case only when NOT in the input field
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
 					ui.filterCaseSensitive = !ui.filterCaseSensitive
