@@ -342,7 +342,7 @@ Stats & tables:
 # Full subnet table (hides free addresses) with Type column
 ./dhcplane stats -c ./config.json --lease-db ./leases.json --details
 
-# Color grid of the whole subnet
+# colour grid of the whole subnet
 ./dhcplane stats -c ./config.json --lease-db ./leases.json --grid
 ```
 
@@ -391,7 +391,7 @@ Flags:
   - `banned-mac` (active lease owned by a banned MAC)
   - `banned-ip` (network/broadcast/server/gateway/exclusions/declined quarantine)
   - `free` (hidden in details output)
-- `--grid`: render a color block grid (green free, red leased, brown reserved, light-gray banned-mac, dark-gray banned/excluded IPs). Requires a color terminal.
+- `--grid`: render a colour block grid (green free, red leased, brown reserved, light-gray banned-mac, dark-gray banned/excluded IPs). Requires a colour terminal.
 
 ### `check`
 
