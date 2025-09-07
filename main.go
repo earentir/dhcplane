@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,23 +28,26 @@ import (
 
 /* ----------------- Config & Types ----------------- */
 
+// Pool represents a range of IP addresses.
 type Pool struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
 }
 
+// StaticRoute represents a static route configuration.
 type StaticRoute struct {
 	CIDR    string `json:"cidr"`
 	Gateway string `json:"gateway"`
 }
 
-// Per-device overrides: ONLY these three
+// DeviceOverride represents per-device DHCP options.
 type DeviceOverride struct {
 	DNS            []string `json:"dns,omitempty"`              // opt 6
 	TFTPServerName string   `json:"tftp_server_name,omitempty"` // opt 66
 	BootFileName   string   `json:"bootfile_name,omitempty"`    // opt 67
 }
 
+// DeviceMeta contains metadata for a device.
 type DeviceMeta struct {
 	FirstSeen           int64  `json:"first_seen,omitempty"` // epoch seconds
 	Note                string `json:"note,omitempty"`
@@ -55,8 +57,7 @@ type DeviceMeta struct {
 	ManagementInterface string `json:"management_interface,omitempty"`
 }
 
-/* Reservations with note (backward-compatible) */
-
+// Reservation represents a DHCP reservation.
 type Reservation struct {
 	IP                  string `json:"ip"`
 	Note                string `json:"note,omitempty"`
@@ -67,9 +68,10 @@ type Reservation struct {
 	ManagementInterface string `json:"management_interface,omitempty"`
 }
 
+// Reservations is a map of MAC addresses to their DHCP reservations.
 type Reservations map[string]Reservation
 
-// Backwards compatibility: allow {"mac":"ip"} format as well as {"mac":{"ip":"...","note":"..."}}
+// UnmarshalJSON implements json.Unmarshaler.
 func (r *Reservations) UnmarshalJSON(b []byte) error {
 	// Try the new format first
 	type newFormat map[string]Reservation
@@ -92,6 +94,7 @@ func (r *Reservations) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Config represents the DHCP server configuration.
 type Config struct {
 	Interface     string   `json:"interface,omitempty"`
 	ServerIP      string   `json:"server_ip"`
@@ -130,6 +133,7 @@ type Config struct {
 	ManagementTypes []string `json:"management_types,omitempty"` // e.g., ssh, web, telnet, serial, console
 }
 
+// Lease represents a DHCP lease.
 type Lease struct {
 	MAC         string `json:"mac"`
 	IP          string `json:"ip"`
@@ -139,6 +143,7 @@ type Lease struct {
 	FirstSeen   int64  `json:"first_seen,omitempty"`   // epoch seconds
 }
 
+// LeaseDB represents a database of DHCP leases.
 type LeaseDB struct {
 	mu    sync.Mutex
 	ByIP  map[string]Lease `json:"by_ip"`
@@ -149,6 +154,7 @@ type LeaseDB struct {
 	decline map[string]time.Time
 }
 
+// NewLeaseDB creates a new LeaseDB instance.
 func NewLeaseDB(path string) *LeaseDB {
 	return &LeaseDB{
 		ByIP:    make(map[string]Lease),
@@ -158,6 +164,7 @@ func NewLeaseDB(path string) *LeaseDB {
 	}
 }
 
+// Load reads the lease database from the specified file.
 func (db *LeaseDB) Load() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -262,6 +269,7 @@ func (db *LeaseDB) Load() error {
 	return nil
 }
 
+// Save writes the lease database to the specified file.
 func (db *LeaseDB) Save() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -302,10 +310,15 @@ func (db *LeaseDB) set(lease Lease) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Always store canonical, lower-case with colons
 	normMac := strings.ToLower(lease.MAC)
+	if nm, err := normalizeMACFlexible(normMac); err == nil {
+		normMac = nm
+	}
+	lease.MAC = normMac
 
 	// If this MAC has an old IP, remove its by_ip entry when IP changes.
-	if old, ok := db.ByMAC[normMac]; ok && old.IP != lease.IP {
+	if old, ok := db.ByMAC[normMac]; ok && !macEqual(old.MAC, lease.MAC) || (ok && old.IP != lease.IP) {
 		delete(db.ByIP, old.IP)
 		// Preserve original first_seen if it exists.
 		if old.FirstSeen > 0 && lease.FirstSeen == 0 {
@@ -313,7 +326,7 @@ func (db *LeaseDB) set(lease Lease) {
 		}
 	}
 	// If the target IP is held by a different MAC, remove that from ByMAC.
-	if old, ok := db.ByIP[lease.IP]; ok && !strings.EqualFold(old.MAC, lease.MAC) {
+	if old, ok := db.ByIP[lease.IP]; ok && !macEqual(old.MAC, lease.MAC) {
 		delete(db.ByMAC, strings.ToLower(old.MAC))
 	}
 
@@ -340,6 +353,9 @@ func (db *LeaseDB) removeByIP(ip string) {
 func (db *LeaseDB) findByMAC(mac string) (Lease, bool) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if nm, err := normalizeMACFlexible(mac); err == nil {
+		mac = nm
+	}
 	l, ok := db.ByMAC[strings.ToLower(mac)]
 	return l, ok
 }
@@ -472,7 +488,7 @@ func parseConfigStrict(path string) (Config, *jsonErr) {
 
 /* ----------------- Small helpers ----------------- */
 
-// ANSI colors for CLI messages
+// ANSI colours for CLI messages
 const (
 	colRed    = "\033[31m"
 	colYellow = "\033[33m"
@@ -584,8 +600,12 @@ func broadcastAddr(n *net.IPNet) net.IP {
 
 /* ----------------- Logging ----------------- */
 
-func setupLogger(path string, console bool) (*log.Logger, *os.File, error) {
+func setupLogger(path string) (*log.Logger, *os.File, error) {
+	// We keep the file logger always clean (no ANSI), and handle console printing ourselves
+	// so we can colourize the console only without polluting the file.
 	if path == "" {
+		// No file; still return a logger that writes to stdout (uncoloured),
+		// we'll add a separate coloured console echo elsewhere.
 		lg := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 		return lg, nil, nil
 	}
@@ -596,28 +616,88 @@ func setupLogger(path string, console bool) (*log.Logger, *os.File, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	var w io.Writer = f
-	if console {
-		w = io.MultiWriter(f, os.Stdout)
-	}
-	lg := log.New(w, "", log.LstdFlags|log.Lmicroseconds)
+	// IMPORTANT: file logger only — no MultiWriter — to avoid ANSI in files.
+	lg := log.New(f, "", log.LstdFlags|log.Lmicroseconds)
 	return lg, f, nil
 }
 
+func colourizeToken(s string, colourStart string, nocolour bool) string {
+	if nocolour {
+		return s
+	}
+	return colourStart + s + colReset
+}
+
+// colourizeConsoleLine highlights key DHCP tokens (REQUEST, DISCOVER, OFFER, ACK, NAK, RELEASE, DECLINE, BANNED-MAC).
+// Green = success-ish, Yellow = info/normal verbs, Red = errors/NAKs/banned.
+func colourizeConsoleLine(line string, nocolour bool) string {
+	if nocolour {
+		return line
+	}
+	// Replace with care on common patterns (token followed by space or end/punct). Keep simple without extra imports.
+	// Order matters: longer/specific first.
+	repls := [][2]string{
+		{" BANNED-MAC", " " + colourizeToken("BANNED-MAC", colRed, nocolour)},
+		{" NAK", " " + colourizeToken("NAK", colRed, nocolour)},
+		{" ACK", " " + colourizeToken("ACK", colGreen, nocolour)},
+		{" OFFER", " " + colourizeToken("OFFER", colGreen, nocolour)},
+		{" REQUEST", " " + colourizeToken("REQUEST", colYellow, nocolour)},
+		{" DISCOVER", " " + colourizeToken("DISCOVER", colYellow, nocolour)},
+		{" RELEASE", " " + colourizeToken("RELEASE", colYellow, nocolour)},
+		{" DECLINE", " " + colourizeToken("DECLINE", colYellow, nocolour)},
+		// Also handle arrow "-> NAK"
+		{"-> NAK", "-> " + colourizeToken("NAK", colRed, nocolour)},
+		// Prefix-without-space fallback (very rare)
+		{"BANNED-MAC", colourizeToken("BANNED-MAC", colRed, nocolour)},
+		{"NAK", colourizeToken("NAK", colRed, nocolour)},
+		{"ACK", colourizeToken("ACK", colGreen, nocolour)},
+		{"OFFER", colourizeToken("OFFER", colGreen, nocolour)},
+		{"REQUEST", colourizeToken("REQUEST", colYellow, nocolour)},
+		{"DISCOVER", colourizeToken("DISCOVER", colYellow, nocolour)},
+		{"RELEASE", colourizeToken("RELEASE", colYellow, nocolour)},
+		{"DECLINE", colourizeToken("DECLINE", colYellow, nocolour)},
+	}
+	out := line
+	for _, rp := range repls {
+		out = strings.ReplaceAll(out, rp[0], rp[1])
+	}
+	return out
+}
+
 func (s *Server) logf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	// Always write a clean line to the file logger if present.
 	if s.logger != nil {
-		s.logger.Printf(format, args...)
+		s.logger.Printf("%s", msg)
+	}
+	// If console echo requested, print a colourized line separately.
+	if s.console {
+		// Match logger timestamp style for human parity.
+		ts := time.Now().Format("2006/01/02 15:04:05.000000")
+		line := ts + " " + msg
+		fmt.Fprintln(os.Stdout, colourizeConsoleLine(line, s.nocolour))
 	}
 }
 
 // errorf logs to file and (if console enabled) prints red to stderr too.
+// errorf logs to file and (if console enabled) prints red-tagged highlights to stderr too.
 func (s *Server) errorf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
+	// File log (clean)
 	if s.logger != nil {
 		s.logger.Printf("ERROR: %s", msg)
 	}
-	// Always also print colored to stderr for operator visibility.
-	fmt.Fprintf(os.Stderr, colRed+"ERROR: %s"+colReset+"\n", msg)
+	// Console/stderr with colourized tokens (including the "ERROR:" prefix in red)
+	ts := time.Now().Format("2006/01/02 15:04:05.000000")
+	line := ts + " ERROR: " + msg
+	if s.nocolour {
+		fmt.Fprintln(os.Stderr, line)
+		return
+	}
+	// colour only the "ERROR" tag; rest will be coloured by token rules.
+	coloured := strings.Replace(line, " ERROR: ", " "+colRed+"ERROR"+colReset+": ", 1)
+	coloured = colourizeConsoleLine(coloured, false)
+	fmt.Fprintln(os.Stderr, coloured)
 }
 
 // xidString logs the 4-byte transaction ID consistently.
@@ -636,6 +716,7 @@ func macDisplay(b []byte) string {
 
 /* ----------------- Server ----------------- */
 
+// Server represents a DHCP server instance.
 type Server struct {
 	mu sync.RWMutex
 
@@ -671,19 +752,12 @@ type Server struct {
 	logFile *os.File
 	console bool
 
-	// NEW: banned MACs (from config) as meta + set
+	// banned MACs (from config) as meta + set
 	bannedMeta map[string]DeviceMeta
 	bannedSet  map[string]struct{}
-}
 
-func normalizeMAC(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	s = strings.ReplaceAll(s, "-", ":")
-	m, err := net.ParseMAC(s)
-	if err != nil {
-		return "", err
-	}
-	return strings.ToLower(m.String()), nil
+	// disable console colours when true (set by --nocolour)
+	nocolour bool
 }
 
 func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old *Server) *Server {
@@ -720,7 +794,7 @@ func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old
 	// Normalize reservations and validate enums
 	res := map[string]string{}
 	for m, rv := range cfg.Reservations {
-		nm, err := normalizeMAC(m)
+		nm, err := normalizeMACFlexible(m) // <— flexible, lower-case, colonized
 		if err != nil {
 			log.Fatalf("bad reservation MAC %q: %v", m, err)
 		}
@@ -739,7 +813,7 @@ func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old
 	// Per-device overrides
 	devOv := map[string]DeviceOverride{}
 	for m, ov := range cfg.DeviceOverrides {
-		nm, err := normalizeMAC(m)
+		nm, err := normalizeMACFlexible(m) // <— flexible
 		if err != nil {
 			log.Fatalf("bad device_overrides MAC %q: %v", m, err)
 		}
@@ -771,7 +845,7 @@ func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old
 	bannedMeta := make(map[string]DeviceMeta)
 	bannedSet := make(map[string]struct{})
 	for m, meta := range cfg.BannedMACs {
-		nm, err := normalizeMACFlexible(m)
+		nm, err := normalizeMACFlexible(m) // <— flexible
 		if err != nil {
 			log.Fatalf("bad banned_macs MAC %q: %v", m, err)
 		}
@@ -836,7 +910,7 @@ func (s *Server) enforceReservationLeaseConsistency() {
 	for mac, r := range s.cfg.Reservations {
 		norm := strings.ToLower(mac)
 		// Reserved IP must not be leased to someone else
-		if l, ok := s.db.ByIP[r.IP]; ok && !strings.EqualFold(l.MAC, norm) {
+		if l, ok := s.db.ByIP[r.IP]; ok && !macEqual(l.MAC, norm) {
 			delete(s.db.ByMAC, strings.ToLower(l.MAC))
 			delete(s.db.ByIP, r.IP)
 			changed = true
@@ -915,17 +989,27 @@ func buildServer(cfgPath string, leasePath string, authoritative bool) *Server {
 
 /* --------------- DHCP handler --------------- */
 
+// Handler handles incoming DHCP requests.
 func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	mt := req.MessageType()
 	dispMAC := macDisplay(req.ClientHWAddr)
-	mac, _ := normalizeMAC(dispMAC)
+
+	// Canonicalize to lower-case "aa:bb:.." and use that everywhere internally.
+	var mac string
+	if nm, err := normalizeMACFlexible(dispMAC); err == nil {
+		mac = nm
+	} else {
+		// very unlikely; keep a lower-cased best-effort so we don't crash
+		mac = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(dispMAC), "-", ":"), " ", ""))
+	}
+
 	hostname := strings.TrimRight(string(req.Options.Get(dhcpv4.OptionHostName)), "\x00")
 
-	// BANNED MAC check (config-based if you use that logic elsewhere)
-	banned := parseBannedMACsEnv() // or s.bannedSet if you switched to config-driven bans
+	// BANNED MAC check (config/env-driven)
+	banned := parseBannedMACsEnv() // or s.bannedSet if you prefer config-only
 	if _, isBanned := banned[mac]; isBanned {
 		s.logf("BANNED-MAC %s (%q) sent %s xid=%s — denying", dispMAC, hostname, mt.String(), xidString(req))
 		warnf("BANNED-MAC %s (%q) sent %s xid=%s — denying", dispMAC, hostname, mt.String(), xidString(req))
@@ -993,7 +1077,7 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			}
 			return
 		}
-		if rmac := s.macForReservedIP(reqIP); rmac != "" && rmac != mac {
+		if rmac := s.macForReservedIP(reqIP); rmac != "" && !macEqual(rmac, mac) { // <-- use macEqual here
 			s.logf("REQUEST %s asked for reserved ip=%s owned by %s -> NAK", dispMAC, reqIP, rmac)
 			if s.authoritative {
 				nak, _ := dhcpv4.NewReplyFromRequest(req)
@@ -1005,7 +1089,7 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		}
 		if l, ok := s.db.findByIP(reqIP.String()); ok {
 			now := time.Now().Unix()
-			if now <= l.Expiry && !strings.EqualFold(l.MAC, mac) {
+			if now <= l.Expiry && !macEqual(l.MAC, mac) {
 				s.logf("REQUEST ip=%s already leased to %s until %s -> NAK", reqIP, l.MAC, formatEpoch(l.Expiry))
 				if s.authoritative {
 					nak, _ := dhcpv4.NewReplyFromRequest(req)
@@ -1025,7 +1109,7 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			firstSeen = time.Now().Unix()
 			// Log to file and console
 			msg := fmt.Sprintf("first_seen: %s here on %s", mac, formatEpoch(firstSeen))
-			s.logf(msg)
+			s.logf("%s", msg)
 			fmt.Fprintf(os.Stdout, "%s\n", msg)
 		}
 
@@ -1099,7 +1183,7 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 		// If someone else actively holds it, we cannot give it yet.
 		if l, ok := s.db.findByIP(ip.String()); ok {
 			now := time.Now().Unix()
-			if now <= l.Expiry && !strings.EqualFold(l.MAC, mac) {
+			if now <= l.Expiry && !macEqual(l.MAC, mac) {
 				return nil, false
 			}
 		}
@@ -1116,11 +1200,11 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 			!s.isExcluded(ip) &&
 			!s.db.isDeclined(ip.String()) {
 
-			if rmac := s.macForReservedIP(ip); rmac != "" && !strings.EqualFold(rmac, mac) {
-				// reserved for another MAC
-			} else {
+			// Proceed only if the IP is NOT reserved for a different MAC.
+			rmac := s.macForReservedIP(ip)
+			if rmac == "" || macEqual(rmac, mac) {
 				if cur, ok := s.db.findByIP(ip.String()); !ok ||
-					strings.EqualFold(cur.MAC, mac) || now > cur.Expiry {
+					macEqual(cur.MAC, mac) || now > cur.Expiry {
 					return ip, true
 				}
 			}
@@ -1140,7 +1224,7 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 		if ip.Equal(network) || ip.Equal(bcast) {
 			return true
 		}
-		if rmac := s.macForReservedIP(ip); rmac != "" && !strings.EqualFold(rmac, mac) {
+		if rmac := s.macForReservedIP(ip); rmac != "" && !macEqual(rmac, mac) {
 			return true
 		}
 		return false
@@ -1170,7 +1254,7 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 			}
 			if l, ok := s.db.findByIP(ip.String()); ok {
 				rmac := s.macForReservedIP(ip)
-				if now > l.Expiry && (strings.EqualFold(l.MAC, mac) || rmac == "" || strings.EqualFold(rmac, mac)) {
+				if now > l.Expiry && (macEqual(l.MAC, mac) || rmac == "" || macEqual(rmac, mac)) {
 					return ip, true
 				}
 				continue
@@ -1410,17 +1494,18 @@ func (s *Server) startWatcher(cfgPath, leasePath string) (*fsnotify.Watcher, err
 	return w, nil
 }
 
-func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath string, console bool, pidPath string) error {
+func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath string, console bool, pidPath string, nocolour bool) error {
 	s := buildServer(cfgPath, leasePath, authoritative)
 
 	// Logger
-	lg, f, err := setupLogger(logPath, console)
+	lg, f, err := setupLogger(logPath)
 	if err != nil {
 		return fmt.Errorf("logger: %w", err)
 	}
 	s.logger = lg
 	s.logFile = f
 	s.console = console
+	s.nocolour = nocolour
 
 	// PID
 	if err := writePID(pidPath); err != nil {
@@ -1582,31 +1667,6 @@ func loadDBAndConfig(leasePath, cfgPath string) (*LeaseDB, Config, error) {
 	return db, cfg, nil
 }
 
-// derive a sane allocation time from AllocatedAt or Expiry-lease
-func deriveAlloc(l Lease, assumeLeaseDur time.Duration, now time.Time) time.Time {
-	n := now.Unix()
-	alloc := l.AllocatedAt
-	if alloc <= 0 || alloc > n {
-		if l.Expiry > 0 {
-			alloc = l.Expiry - int64(assumeLeaseDur.Seconds())
-			if alloc > n {
-				alloc = n
-			}
-		} else {
-			alloc = n
-		}
-	}
-	return time.Unix(alloc, 0)
-}
-
-// clamp negatives to zero for printing
-func clampNonNegative(d time.Duration) time.Duration {
-	if d < 0 {
-		return 0
-	}
-	return d
-}
-
 func classifyLeases(db *LeaseDB, assumeLeaseDur time.Duration) (curr, expiring, expired []leaseView) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1674,31 +1734,6 @@ func countAllocations(db *LeaseDB, assumeLeaseDur time.Duration) (perMinute, per
 	return
 }
 
-func humanDur(d time.Duration) string {
-	neg := d < 0
-	if neg {
-		d = -d
-	}
-	d = d.Truncate(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	var b strings.Builder
-	if neg {
-		b.WriteString("-")
-	}
-	if h > 0 {
-		fmt.Fprintf(&b, "%dh%dm%ds", h, m, s)
-	} else if m > 0 {
-		fmt.Fprintf(&b, "%dm%ds", m, s)
-	} else {
-		fmt.Fprintf(&b, "%ds", s)
-	}
-	return b.String()
-}
-
 func printLeaseTable(title string, rows []leaseView, assumeLeaseDur time.Duration) {
 	if len(rows) == 0 {
 		fmt.Printf("\n%s: (none)\n", title)
@@ -1732,18 +1767,7 @@ func printLeaseTable(title string, rows []leaseView, assumeLeaseDur time.Duratio
 
 /* ----------------- Grid rendering helpers ----------------- */
 
-// termWidth returns an estimated terminal width; uses $COLUMNS when set.
-// (Dependency-free; good enough for layout.)
-func termWidth() int {
-	if v := strings.TrimSpace(os.Getenv("COLUMNS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 100
-}
-
-// drawSubnetGrid renders the entire IPv4 subnet (host range only) as a color grid:
+// drawSubnetGrid renders the entire IPv4 subnet (host range only) as a colour grid:
 //
 //	red       █ = leased (unexpired; from leases DB)
 //	brown     █ = reserved/fixed (from config.reservations; only if not actively leased)
@@ -1753,7 +1777,7 @@ func termWidth() int {
 //
 // Each row is prefixed with the last octet of the first IP in that row.
 func drawSubnetGrid(db *LeaseDB, subnetCIDR string) error {
-	// Aurora colors
+	// Aurora colours
 	blkLeased := aurora.Red("█")
 	blkReserved := aurora.Brown("█")
 	blkBannedIP := aurora.Gray(8, "█")   // dark gray
@@ -1955,6 +1979,7 @@ func main() {
 		logPath       string
 		console       bool
 		pidPath       string
+		nocolour      bool
 	)
 
 	root := &cobra.Command{
@@ -1967,17 +1992,19 @@ func main() {
 	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path (empty to log only to console)")
 	root.PersistentFlags().BoolVar(&console, "console", false, "Also print logs to stdout in addition to --log")
 	root.PersistentFlags().StringVar(&pidPath, "pid-file", "dhcplane.pid", "PID file for reload control")
+	// NEW: global flag to disable console colours
+	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
 
 	/* ---- serve ---- */
 	serveCmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the DHCP server",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			// Validate config before start
 			if _, jerr := parseConfigStrict(cfgPath); jerr != nil {
 				return fmt.Errorf("config error: %w", jerr)
 			}
-			return buildServerAndRun(cfgPath, leasePath, authoritative, logPath, console, pidPath)
+			return buildServerAndRun(cfgPath, leasePath, authoritative, logPath, console, pidPath, nocolour)
 		},
 	}
 
@@ -1985,7 +2012,7 @@ func main() {
 	showCmd := &cobra.Command{
 		Use:   "leases",
 		Short: "Print current leases",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			db := NewLeaseDB(leasePath)
 			if err := db.Load(); err != nil {
 				return err
@@ -2030,8 +2057,8 @@ func main() {
 	var grid bool
 	statsCmd := &cobra.Command{
 		Use:   "stats",
-		Short: "Show allocation rates and lease status (add --details for a full table, --grid for a color grid)",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		Short: "Show allocation rates and lease status (add --details for a full table, --grid for a colour grid)",
+		RunE: func(_ *cobra.Command, _ []string) error {
 			db, cfg, err := loadDBAndConfig(leasePath, cfgPath)
 			if err != nil {
 				return err
@@ -2068,13 +2095,13 @@ func main() {
 		},
 	}
 	statsCmd.Flags().BoolVar(&details, "details", false, "Print a full table for the whole subnet including Type")
-	statsCmd.Flags().BoolVar(&grid, "grid", false, "Render a full-subnet color grid (green=free, red=leased, brown=reserved, light-gray=banned-mac, dark-gray=banned/excluded IPs)")
+	statsCmd.Flags().BoolVar(&grid, "grid", false, "Render a full-subnet colour grid (green=free, red=leased, brown=reserved, light-gray=banned-mac, dark-gray=banned/excluded IPs)")
 
 	/* ---- check ---- */
 	checkCmd := &cobra.Command{
 		Use:   "check",
 		Short: "Validate the JSON config and exit (reports line/column on errors)",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			_, jerr := parseConfigStrict(cfgPath)
 			if jerr != nil {
 				return jerr
@@ -2088,7 +2115,7 @@ func main() {
 	reloadCmd := &cobra.Command{
 		Use:   "reload",
 		Short: "Signal a running server to reload the config (SIGHUP via PID file)",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			// Check file is valid before signaling
 			_, jerr := parseConfigStrict(cfgPath)
 			if jerr != nil {
@@ -2116,7 +2143,7 @@ func main() {
 		Use:   "add <mac> <ip> [note...]",
 		Short: "Add or update a MAC→IP reservation; optional note",
 		Args:  cobra.MinimumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, args []string) error {
 			norm, err := normalizeMACFlexible(args[0])
 			if err != nil {
 				return errf("invalid mac: %v", err)
@@ -2141,7 +2168,7 @@ func main() {
 
 			// Conflict A: IP already reserved for someone else?
 			for macKey, res := range cfg.Reservations {
-				if strings.EqualFold(macKey, norm) {
+				if macEqual(macKey, norm) {
 					continue
 				}
 				if res.IP == ip.String() {
@@ -2152,7 +2179,7 @@ func main() {
 			// Conflict B: IP currently leased to a different MAC? (warn)
 			db := NewLeaseDB(leasePath)
 			_ = db.Load()
-			if l, ok := db.findByIP(ip.String()); ok && !strings.EqualFold(l.MAC, norm) {
+			if l, ok := db.findByIP(ip.String()); ok && !macEqual(l.MAC, norm) {
 				warnf("IP %s currently leased to %s (hostname=%q) until %s",
 					ip.String(), l.MAC, l.Hostname, formatEpoch(l.Expiry))
 			}
@@ -2168,7 +2195,6 @@ func main() {
 					IP:        ip.String(),
 					Note:      note,
 					FirstSeen: now,
-					// leave equipment/manufacturer/management fields at their zero values unless provided elsewhere
 				}
 				fmt.Printf("Added reservation: %s -> %s  note=%q  first_seen=%s\n",
 					norm, ip.String(), note, formatEpoch(now))
@@ -2220,7 +2246,7 @@ func main() {
 		Use:   "remove <mac>",
 		Short: "Remove a MAC→IP reservation (and note) from the config",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, args []string) error {
 			norm, err := normalizeMACFlexible(args[0])
 			if err != nil {
 				return errf("invalid mac: %v", err)
@@ -2524,4 +2550,29 @@ func humanDurSecs(secs int64) string {
 		return fmt.Sprintf("%dm%ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+// CanonMAC returns a canonical, lower-case "aa:bb:cc:dd:ee:ff".
+func CanonMAC(s string) (string, error) {
+	return normalizeMACFlexible(s)
+}
+
+// MustCanonMAC panics if s cannot be normalized.
+func MustCanonMAC(s string) string {
+	n, err := CanonMAC(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// macEqual normalizes both sides (accepts "aa:..", "aa-..", or "aabb..") and compares.
+func macEqual(a, b string) bool {
+	na, ea := CanonMAC(a)
+	nb, eb := CanonMAC(b)
+	if ea == nil && eb == nil {
+		return na == nb
+	}
+	// Fallback: case-insensitive direct compare if one side failed normalization.
+	return strings.EqualFold(a, b)
 }
