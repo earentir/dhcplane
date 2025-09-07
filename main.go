@@ -19,10 +19,12 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/gdamore/tcell/v2"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	"github.com/insomniacslk/dhcp/rfc1035label"
 	"github.com/logrusorgru/aurora"
+	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
 )
 
@@ -131,6 +133,9 @@ type Config struct {
 	// Allowed enumerations (user-extendable)
 	EquipmentTypes  []string `json:"equipment_types,omitempty"`  // e.g., Switch, Router, AP, Modem, Gateway
 	ManagementTypes []string `json:"management_types,omitempty"` // e.g., ssh, web, telnet, serial, console
+
+	//Max console buffer
+	ConsoleMaxLines int `json:"console_max_lines,omitempty"`
 }
 
 // Lease represents a DHCP lease.
@@ -417,6 +422,432 @@ func (db *LeaseDB) compactNow(grace time.Duration) int {
 	return n
 }
 
+/* ----------------- Console ----------------- */
+
+// ConsoleUI represents the interactive console UI using tview.
+type ConsoleUI struct {
+	app        *tview.Application
+	logView    *tview.TextView
+	inputField *tview.InputField
+	statusText *tview.TextView
+	bottomBox  *tview.Flex
+
+	mu                  sync.Mutex
+	lines               []string // ring buffer content
+	maxLines            int      // buffer cap
+	filter              string
+	filterActive        bool
+	filterCaseSensitive bool
+	paused              bool
+	nocolour            bool
+	mouseOn             bool
+
+	lastFocus string // "log" or "input"
+}
+
+// NewConsoleUI builds the interactive console using tview.
+func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
+	if maxLines <= 0 {
+		maxLines = 10000
+	}
+	app := tview.NewApplication()
+	ui := &ConsoleUI{
+		app:      app,
+		nocolour: nocolour,
+		maxLines: maxLines,
+		mouseOn:  false, // start with terminal-native drag-to-copy
+	}
+
+	// Main log view
+	logView := tview.NewTextView().
+		SetDynamicColors(!nocolour).
+		SetScrollable(true).
+		SetWrap(false)
+	logView.SetTitle(" logs ").SetBorder(true)
+	ui.logView = logView
+
+	// Input line
+	input := tview.NewInputField().
+		SetLabel("> ").
+		SetFieldWidth(0)
+	ui.inputField = input
+
+	// Status/help line (non-focusable)
+	status := tview.NewTextView().
+		SetDynamicColors(!nocolour).
+		SetWrap(false)
+	ui.statusText = status
+
+	// Bottom box: input + status inside a single bordered container
+	bottom := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(input, 1, 0, true).
+		AddItem(status, 1, 0, false)
+	bottom.SetTitle(" console ").SetBorder(true)
+	ui.bottomBox = bottom
+
+	// Layout: logs on top, bottom console below
+	root := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(logView, 0, 1, false).
+		AddItem(bottom, 4, 0, true) // 1 (input) + 1 (status) + 2 (border)
+
+	// Key bindings
+	ui.bindKeys()
+
+	// Initial titles/focus indication
+	ui.lastFocus = "input"
+	ui.logView.SetTitle(" logs ")
+	ui.bottomBox.SetTitle(" [::b]console[::-] ")
+
+	// Mouse off by default for native drag-copy
+	ui.app.EnableMouse(false)
+
+	ui.app.SetRoot(root, true)
+	ui.app.SetFocus(input) // input focused initially
+
+	// Build the initial help/status line via the central formatter
+	ui.updateStatusDirect()
+
+	return ui
+}
+
+// Do schedules a UI update on tview's UI goroutine.
+func (ui *ConsoleUI) Do(fn func()) { ui.app.QueueUpdateDraw(fn) }
+
+func (ui *ConsoleUI) bindKeys() {
+	// Input behaviors — runs on tview's UI goroutine
+	ui.inputField.SetDoneFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyEnter:
+			// Toggle filter state; DO NOT clear the text when disabling
+			ui.mu.Lock()
+			txt := ui.inputField.GetText()
+			if ui.filterActive {
+				ui.filterActive = false
+				// keep ui.filter and input text intact so user can re-enable quickly
+			} else {
+				ui.filterActive = true
+				ui.filter = txt
+			}
+			ui.mu.Unlock()
+
+			ui.updateStatusDirect()
+			ui.refreshDirect()
+
+		case tcell.KeyEsc:
+			ui.mu.Lock()
+			ui.filterActive = false
+			ui.filter = ""
+			ui.inputField.SetText("") // explicit clear via Esc
+			ui.mu.Unlock()
+
+			ui.updateStatusDirect()
+			ui.refreshDirect()
+		}
+	})
+
+	// Global keymap — runs on the UI goroutine
+	ui.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Key() {
+		case tcell.KeyTab: // cycle focus: log <-> input
+			if ui.app.GetFocus() == ui.logView {
+				ui.app.SetFocus(ui.inputField)
+				ui.updateTitlesDirect("input")
+			} else {
+				ui.app.SetFocus(ui.logView)
+				ui.updateTitlesDirect("log")
+			}
+			return nil
+
+		case tcell.KeyBacktab: // Shift+Tab reverse
+			if ui.app.GetFocus() == ui.inputField {
+				ui.app.SetFocus(ui.logView)
+				ui.updateTitlesDirect("log")
+			} else {
+				ui.app.SetFocus(ui.inputField)
+				ui.updateTitlesDirect("input")
+			}
+			return nil
+
+		case tcell.KeyCtrlL:
+			if ui.app.GetFocus() == ui.inputField {
+				ui.inputField.SetText("")
+				return nil
+			}
+
+		case tcell.KeyCtrlC:
+			ui.app.EnableMouse(false)
+			ui.app.Stop()
+			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+			return nil
+
+		case tcell.KeyRune:
+			// When input is focused, let q/Q, m, space, c/C pass through to the input field
+			if ui.app.GetFocus() == ui.inputField {
+				switch ev.Rune() {
+				case 'q', 'Q', 'm', ' ', 'c', 'C':
+					return ev // allow typing into input
+				}
+			}
+
+			switch ev.Rune() {
+			case '/':
+				ui.app.SetFocus(ui.inputField)
+				ui.updateTitlesDirect("input")
+				return nil
+
+			case 'q', 'Q':
+				// Only quit when NOT in input
+				if ui.app.GetFocus() != ui.inputField {
+					ui.app.EnableMouse(false)
+					ui.app.Stop()
+					_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+					return nil
+				}
+				return ev
+
+			case 'm': // toggle tview mouse handling
+				if ui.app.GetFocus() != ui.inputField {
+					ui.mu.Lock()
+					ui.mouseOn = !ui.mouseOn
+					on := ui.mouseOn
+					ui.mu.Unlock()
+					ui.app.EnableMouse(on)
+					ui.updateStatusDirect()
+					return nil
+				}
+				return ev
+
+			case 'c', 'C': // toggle case sensitivity for filter
+				if ui.app.GetFocus() != ui.inputField {
+					ui.mu.Lock()
+					ui.filterCaseSensitive = !ui.filterCaseSensitive
+					ui.mu.Unlock()
+					ui.updateStatusDirect()
+					ui.refreshDirect()
+					return nil
+				}
+				return ev
+
+			case ' ':
+				// Pause/resume only when NOT in the input field
+				if ui.app.GetFocus() != ui.inputField {
+					ui.mu.Lock()
+					ui.paused = !ui.paused
+					ui.mu.Unlock()
+					ui.updateStatusDirect()
+					return nil
+				}
+				return ev
+			}
+
+		case tcell.KeyUp:
+			row, col := ui.logView.GetScrollOffset()
+			if row > 0 {
+				ui.logView.ScrollTo(row-1, col)
+			}
+			return nil
+
+		case tcell.KeyDown:
+			row, col := ui.logView.GetScrollOffset()
+			ui.logView.ScrollTo(row+1, col)
+			return nil
+
+		case tcell.KeyPgUp:
+			_, _, _, h := ui.logView.GetInnerRect()
+			if h < 1 {
+				h = 1
+			}
+			row, col := ui.logView.GetScrollOffset()
+			nr := row - (h - 1)
+			if nr < 0 {
+				nr = 0
+			}
+			ui.logView.ScrollTo(nr, col)
+			return nil
+
+		case tcell.KeyPgDn:
+			_, _, _, h := ui.logView.GetInnerRect()
+			if h < 1 {
+				h = 1
+			}
+			row, col := ui.logView.GetScrollOffset()
+			ui.logView.ScrollTo(row+(h-1), col)
+			return nil
+
+		case tcell.KeyHome:
+			ui.logView.ScrollToBeginning()
+			return nil
+
+		case tcell.KeyEnd:
+			ui.logView.ScrollToEnd()
+			return nil
+		}
+		return ev
+	})
+}
+
+// updateTitlesDirect updates titles directly on the UI goroutine.
+func (ui *ConsoleUI) updateTitlesDirect(focus string) {
+	if focus != ui.lastFocus {
+		if focus == "log" {
+			ui.logView.SetTitle(" [::b]logs[::-] ")
+			ui.bottomBox.SetTitle(" console ")
+		} else {
+			ui.logView.SetTitle(" logs ")
+			ui.bottomBox.SetTitle(" [::b]console[::-] ")
+		}
+		ui.lastFocus = focus
+	}
+}
+
+// updateStatusDirect updates the status/help line directly.
+// Call this ONLY from the UI goroutine (e.g., inside widget callbacks).
+func (ui *ConsoleUI) updateStatusDirect() {
+	ui.statusText.Clear()
+
+	ui.mu.Lock()
+	mouseOn := ui.mouseOn
+	filterOn := ui.filterActive
+	caseOn := ui.filterCaseSensitive
+	paused := ui.paused
+	nc := ui.nocolour
+	ui.mu.Unlock()
+
+	mouse := "Off"
+	filter := "Off"
+	cs := "Off"
+	pause := "Running"
+	if mouseOn {
+		mouse = "On"
+	}
+	if filterOn {
+		filter = "Active"
+	}
+	if caseOn {
+		cs = "On"
+	}
+	if paused {
+		pause = "Paused"
+	}
+
+	if nc {
+		// No color: plain text but same structure
+		ui.statusText.SetText(
+			fmt.Sprintf("Home/End top/bottom · ↑/↓ PgUp/PgDn scroll · space pause · Tab focus · mouse:%s · filter:%s · case:%s · esc clear · q quit · %s",
+				mouse, filter, cs, pause))
+		return
+	}
+
+	// Colored keys in blue, states colored as before
+	ui.statusText.SetText(
+		fmt.Sprintf("[blue]Home[-]/[blue]End[-] top/bottom · [blue]↑[-]/[blue]↓[-] [blue]PgUp[-]/[blue]PgDn[-] scroll · [blue]space[-] pause · [blue]Tab[-] focus · [blue]m[-]ouse:[green]%s[-] · filter:[yellow]%s[-] · [blue]c[-]ase:[magenta]%s[-] · [blue]esc[-] clear · [blue]q[-] quit · [cyan]%s[-]",
+			mouse, filter, cs, pause))
+}
+
+// refreshDirect repaints the log view directly.
+// Call this ONLY from the UI goroutine (e.g., inside widget callbacks).
+func (ui *ConsoleUI) refreshDirect() {
+	ui.logView.Clear()
+	for _, l := range ui.filteredLines() {
+		fmt.Fprintln(ui.logView, l)
+	}
+}
+
+// Start starts the console UI.
+func (ui *ConsoleUI) Start() {
+	go func() {
+		if err := ui.app.Run(); err != nil {
+			log.Fatalf("console UI failed: %v", err)
+		}
+	}()
+}
+
+// Stop stops the console UI.
+func (ui *ConsoleUI) Stop() {
+	ui.app.EnableMouse(false)
+	ui.app.Stop()
+}
+
+// Append appends one line, respecting pause and autoscroll, with bounded ring buffer.
+func (ui *ConsoleUI) Append(line string) {
+	ui.mu.Lock()
+	ui.lines = append(ui.lines, line)
+	if len(ui.lines) > ui.maxLines {
+		excess := len(ui.lines) - ui.maxLines
+		ui.lines = ui.lines[excess:]
+	}
+	paused := ui.paused
+	ui.mu.Unlock()
+
+	if paused {
+		return
+	}
+
+	ui.Do(func() {
+		atBottom := ui.atBottom()
+		ui.logView.Clear()
+		for _, l := range ui.filteredLines() {
+			fmt.Fprintln(ui.logView, l)
+		}
+		if atBottom {
+			ui.logView.ScrollToEnd()
+		}
+	})
+}
+
+func (ui *ConsoleUI) filteredLines() []string {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+
+	flt := ui.filter
+	active := ui.filterActive
+	caseSens := ui.filterCaseSensitive
+
+	if !active || strings.TrimSpace(flt) == "" {
+		out := make([]string, len(ui.lines))
+		copy(out, ui.lines)
+		return out
+	}
+
+	out := make([]string, 0, len(ui.lines))
+	if caseSens {
+		for _, l := range ui.lines {
+			if strings.Contains(l, flt) {
+				out = append(out, l)
+			}
+		}
+	} else {
+		want := strings.ToLower(flt)
+		for _, l := range ui.lines {
+			if strings.Contains(strings.ToLower(l), want) {
+				out = append(out, l)
+			}
+		}
+	}
+	return out
+}
+
+func (ui *ConsoleUI) atBottom() bool {
+	// Must be called on UI thread via ui.Do.
+	filtered := ui.filteredLines()
+	total := len(filtered)
+	row, _ := ui.logView.GetScrollOffset()
+	_, _, _, h := ui.logView.GetInnerRect()
+	if h <= 0 {
+		h = 1
+	}
+	if total == 0 {
+		return true
+	}
+	threshold := total - h
+	if threshold < 0 {
+		threshold = 0
+	}
+	return row >= threshold
+}
+
 /* ----------------- Config parsing & validation ----------------- */
 
 type jsonErr struct {
@@ -488,22 +919,18 @@ func parseConfigStrict(path string) (Config, *jsonErr) {
 
 /* ----------------- Small helpers ----------------- */
 
-// ANSI colours for CLI messages
-const (
-	colRed    = "\033[31m"
-	colYellow = "\033[33m"
-	colGreen  = "\033[32m"
-	colReset  = "\033[0m"
-)
-
 func errf(format string, a ...any) error {
 	msg := fmt.Sprintf(format, a...)
-	fmt.Fprintf(os.Stderr, colRed+"ERROR: %s"+colReset+"\n", msg)
+	// File logger stays clean. This helper is only for immediate stderr prints.
+	// Use aurora for colour; respect the user’s preference elsewhere if needed.
+	fmt.Fprintln(os.Stderr, aurora.Red(fmt.Sprintf("ERROR: %s", msg)))
 	return errors.New(msg)
 }
+
 func warnf(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
-	fmt.Fprintf(os.Stderr, colYellow+"WARNING: %s"+colReset+"\n", msg)
+	// Immediate stderr warning with aurora; file logs remain clean.
+	fmt.Fprintln(os.Stderr, aurora.Yellow(fmt.Sprintf("WARNING: %s", msg)))
 }
 
 // Accepts with ":" "-" or no separators (12 hex chars)
@@ -621,41 +1048,32 @@ func setupLogger(path string) (*log.Logger, *os.File, error) {
 	return lg, f, nil
 }
 
-func colourizeToken(s string, colourStart string, nocolour bool) string {
-	if nocolour {
-		return s
-	}
-	return colourStart + s + colReset
-}
-
 // colourizeConsoleLine highlights key DHCP tokens (REQUEST, DISCOVER, OFFER, ACK, NAK, RELEASE, DECLINE, BANNED-MAC).
 // Green = success-ish, Yellow = info/normal verbs, Red = errors/NAKs/banned.
 func colourizeConsoleLine(line string, nocolour bool) string {
 	if nocolour {
 		return line
 	}
-	// Replace with care on common patterns (token followed by space or end/punct). Keep simple without extra imports.
-	// Order matters: longer/specific first.
+	// Map important tokens to tview color tags.
 	repls := [][2]string{
-		{" BANNED-MAC", " " + colourizeToken("BANNED-MAC", colRed, nocolour)},
-		{" NAK", " " + colourizeToken("NAK", colRed, nocolour)},
-		{" ACK", " " + colourizeToken("ACK", colGreen, nocolour)},
-		{" OFFER", " " + colourizeToken("OFFER", colGreen, nocolour)},
-		{" REQUEST", " " + colourizeToken("REQUEST", colYellow, nocolour)},
-		{" DISCOVER", " " + colourizeToken("DISCOVER", colYellow, nocolour)},
-		{" RELEASE", " " + colourizeToken("RELEASE", colYellow, nocolour)},
-		{" DECLINE", " " + colourizeToken("DECLINE", colYellow, nocolour)},
-		// Also handle arrow "-> NAK"
-		{"-> NAK", "-> " + colourizeToken("NAK", colRed, nocolour)},
-		// Prefix-without-space fallback (very rare)
-		{"BANNED-MAC", colourizeToken("BANNED-MAC", colRed, nocolour)},
-		{"NAK", colourizeToken("NAK", colRed, nocolour)},
-		{"ACK", colourizeToken("ACK", colGreen, nocolour)},
-		{"OFFER", colourizeToken("OFFER", colGreen, nocolour)},
-		{"REQUEST", colourizeToken("REQUEST", colYellow, nocolour)},
-		{"DISCOVER", colourizeToken("DISCOVER", colYellow, nocolour)},
-		{"RELEASE", colourizeToken("RELEASE", colYellow, nocolour)},
-		{"DECLINE", colourizeToken("DECLINE", colYellow, nocolour)},
+		{" BANNED-MAC", " [red::b]BANNED-MAC[-:-:-]"},
+		{" NAK", " [red::b]NAK[-:-:-]"},
+		{" ACK", " [green::b]ACK[-:-:-]"},
+		{" OFFER", " [green::b]OFFER[-:-:-]"},
+		{" REQUEST", " [yellow::b]REQUEST[-:-:-]"},
+		{" DISCOVER", " [yellow::b]DISCOVER[-:-:-]"},
+		{" RELEASE", " [yellow::b]RELEASE[-:-:-]"},
+		{" DECLINE", " [yellow::b]DECLINE[-:-:-]"},
+
+		{"-> NAK", "-> [red::b]NAK[-:-:-]"},
+		{"BANNED-MAC", "[red::b]BANNED-MAC[-:-:-]"},
+		{"NAK", "[red::b]NAK[-:-:-]"},
+		{"ACK", "[green::b]ACK[-:-:-]"},
+		{"OFFER", "[green::b]OFFER[-:-:-]"},
+		{"REQUEST", "[yellow::b]REQUEST[-:-:-]"},
+		{"DISCOVER", "[yellow::b]DISCOVER[-:-:-]"},
+		{"RELEASE", "[yellow::b]RELEASE[-:-:-]"},
+		{"DECLINE", "[yellow::b]DECLINE[-:-:-]"},
 	}
 	out := line
 	for _, rp := range repls {
@@ -666,38 +1084,31 @@ func colourizeConsoleLine(line string, nocolour bool) string {
 
 func (s *Server) logf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	// Always write a clean line to the file logger if present.
+
 	if s.logger != nil {
 		s.logger.Printf("%s", msg)
 	}
-	// If console echo requested, print a colourized line separately.
-	if s.console {
-		// Match logger timestamp style for human parity.
+
+	if s.consoleUI != nil {
 		ts := time.Now().Format("2006/01/02 15:04:05.000000")
-		line := ts + " " + msg
-		fmt.Fprintln(os.Stdout, colourizeConsoleLine(line, s.nocolour))
+		line := colourizeConsoleLine(ts+" "+msg, s.nocolour)
+		s.consoleUI.Append(line)
 	}
 }
 
-// errorf logs to file and (if console enabled) prints red to stderr too.
 // errorf logs to file and (if console enabled) prints red-tagged highlights to stderr too.
 func (s *Server) errorf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	// File log (clean)
+
 	if s.logger != nil {
 		s.logger.Printf("ERROR: %s", msg)
 	}
-	// Console/stderr with colourized tokens (including the "ERROR:" prefix in red)
-	ts := time.Now().Format("2006/01/02 15:04:05.000000")
-	line := ts + " ERROR: " + msg
-	if s.nocolour {
-		fmt.Fprintln(os.Stderr, line)
-		return
+
+	if s.consoleUI != nil {
+		ts := time.Now().Format("2006/01/02 15:04:05.000000")
+		line := aurora.Red("ERROR").String() + ": " + msg
+		s.consoleUI.Append(ts + " " + line)
 	}
-	// colour only the "ERROR" tag; rest will be coloured by token rules.
-	coloured := strings.Replace(line, " ERROR: ", " "+colRed+"ERROR"+colReset+": ", 1)
-	coloured = colourizeConsoleLine(coloured, false)
-	fmt.Fprintln(os.Stderr, coloured)
 }
 
 // xidString logs the 4-byte transaction ID consistently.
@@ -758,6 +1169,9 @@ type Server struct {
 
 	// disable console colours when true (set by --nocolour)
 	nocolour bool
+
+	// used for console UI
+	consoleUI *ConsoleUI
 }
 
 func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old *Server) *Server {
@@ -1107,10 +1521,10 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			firstSeen = prev.FirstSeen
 		} else {
 			firstSeen = time.Now().Unix()
-			// Log to file and console
+			// Log to file and console only; DO NOT write to stdout
 			msg := fmt.Sprintf("first_seen: %s here on %s", mac, formatEpoch(firstSeen))
 			s.logf("%s", msg)
-			fmt.Fprintf(os.Stdout, "%s\n", msg)
+			// (removed) fmt.Fprintf(os.Stdout, "%s\n", msg)
 		}
 
 		now := time.Now().Unix()
@@ -1497,7 +1911,6 @@ func (s *Server) startWatcher(cfgPath, leasePath string) (*fsnotify.Watcher, err
 func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath string, console bool, pidPath string, nocolour bool) error {
 	s := buildServer(cfgPath, leasePath, authoritative)
 
-	// Logger
 	lg, f, err := setupLogger(logPath)
 	if err != nil {
 		return fmt.Errorf("logger: %w", err)
@@ -1506,6 +1919,16 @@ func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath st
 	s.logFile = f
 	s.console = console
 	s.nocolour = nocolour
+
+	if console {
+		maxLines := s.cfg.ConsoleMaxLines
+		if maxLines <= 0 {
+			maxLines = 10000
+		}
+		s.consoleUI = NewConsoleUI(nocolour, maxLines)
+		s.consoleUI.Start()
+		defer s.consoleUI.Stop()
+	}
 
 	// PID
 	if err := writePID(pidPath); err != nil {
