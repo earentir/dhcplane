@@ -28,6 +28,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var appVersion = "0.1.29"
+
 /* ----------------- Config & Types ----------------- */
 
 // Pool represents a range of IP addresses.
@@ -429,8 +431,12 @@ type ConsoleUI struct {
 	app        *tview.Application
 	logView    *tview.TextView
 	inputField *tview.InputField
+	topSep     *tview.TextView
+	bottomSep  *tview.TextView
 	statusText *tview.TextView
 	bottomBox  *tview.Flex
+	reqTimes   []time.Time
+	ackTimes   []time.Time
 
 	mu                  sync.Mutex
 	lines               []string // ring buffer content
@@ -463,51 +469,43 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 		SetDynamicColors(!nocolour).
 		SetScrollable(true).
 		SetWrap(false)
-	logView.SetTitle(" logs ").SetBorder(true)
 	ui.logView = logView
 
-	// Input line
+	// Separators (top/bottom lines around the log view)
+	ui.topSep = tview.NewTextView().SetWrap(false)
+	ui.bottomSep = tview.NewTextView().SetWrap(false)
+
+	// Input field (single line at the bottom)
 	input := tview.NewInputField().
 		SetLabel("> ").
 		SetFieldWidth(0)
 	ui.inputField = input
 
-	// Status/help line (non-focusable)
-	status := tview.NewTextView().
-		SetDynamicColors(!nocolour).
-		SetWrap(false)
-	ui.statusText = status
-
-	// Bottom box: input + status inside a single bordered container
+	// Bottom container (just the input; no borders)
 	bottom := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(input, 1, 0, true).
-		AddItem(status, 1, 0, false)
-	bottom.SetTitle(" console ").SetBorder(true)
+		AddItem(input, 1, 0, true)
 	ui.bottomBox = bottom
 
-	// Layout: logs on top, bottom console below
+	// Root layout: top sep, log, bottom sep, then input
 	root := tview.NewFlex().
 		SetDirection(tview.FlexRow).
+		AddItem(ui.topSep, 1, 0, false).
 		AddItem(logView, 0, 1, false).
-		AddItem(bottom, 4, 0, true) // 1 (input) + 1 (status) + 2 (border)
+		AddItem(ui.bottomSep, 1, 0, false).
+		AddItem(bottom, 1, 0, true)
 
 	// Key bindings
 	ui.bindKeys()
 
-	// Initial titles/focus indication
+	// Initial focus: input line active
 	ui.lastFocus = "input"
-	ui.logView.SetTitle(" logs ")
-	ui.bottomBox.SetTitle(" [::b]console[::-] ")
-
-	// Mouse off by default for native drag-copy
 	ui.app.EnableMouse(false)
-
 	ui.app.SetRoot(root, true)
-	ui.app.SetFocus(input) // input focused initially
+	ui.app.SetFocus(input)
 
-	// Build the initial help/status line via the central formatter
-	ui.updateStatusDirect()
+	// Set initial separators (single for unfocused log)
+	ui.setLogSeparators(false)
 
 	return ui
 }
@@ -515,57 +513,40 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 // Do schedules a UI update on tview's UI goroutine.
 func (ui *ConsoleUI) Do(fn func()) { ui.app.QueueUpdateDraw(fn) }
 
+// bindKeys wires all key handling. Global keys act only when the log view is focused.
+// Input-line keys are handled via the input field callbacks.
+// bindKeys wires global and input-specific key handling.
 func (ui *ConsoleUI) bindKeys() {
-	// Live update the filter as the user types (only when filter is active)
-	ui.inputField.SetChangedFunc(func(text string) {
-		ui.mu.Lock()
-		active := ui.filterActive
-		ui.mu.Unlock()
-		if active {
-			ui.mu.Lock()
-			ui.filter = text
-			ui.mu.Unlock()
-			ui.refreshDirect() // repaint immediately with the new filter
-		}
-	})
-
 	// Input behaviors — runs on tview's UI goroutine
 	ui.inputField.SetDoneFunc(func(key tcell.Key) {
 		switch key {
 		case tcell.KeyEnter:
+			// Toggle filter state; DO NOT clear the text when disabling
 			ui.mu.Lock()
 			txt := ui.inputField.GetText()
 			if ui.filterActive {
-				// keep text; just deactivate the filter
 				ui.filterActive = false
+				// keep ui.filter and input text intact so user can re-enable quickly
 			} else {
 				ui.filterActive = true
 				ui.filter = txt
 			}
 			ui.mu.Unlock()
-			ui.updateStatusDirect()
+
+			// repaint
 			ui.refreshDirect()
 
 		case tcell.KeyEsc:
 			ui.mu.Lock()
 			ui.filterActive = false
 			ui.filter = ""
-			ui.inputField.SetText("")
+			ui.inputField.SetText("") // explicit clear via Esc
 			ui.mu.Unlock()
-			ui.updateStatusDirect()
+
+			// repaint
 			ui.refreshDirect()
 		}
 	})
-
-	// Helper: stop UI and exit process (works on all OSes)
-	exitNow := func(code int) {
-		ui.app.EnableMouse(false)
-		ui.app.Stop()
-		go func() {
-			time.Sleep(25 * time.Millisecond)
-			os.Exit(code)
-		}()
-	}
 
 	// Global keymap — runs on the UI goroutine
 	ui.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
@@ -573,196 +554,157 @@ func (ui *ConsoleUI) bindKeys() {
 		case tcell.KeyTab: // cycle focus: log <-> input
 			if ui.app.GetFocus() == ui.logView {
 				ui.app.SetFocus(ui.inputField)
-				ui.updateTitlesDirect("input")
+				// log loses focus → single line separators
+				ui.setLogSeparators(false)
 			} else {
 				ui.app.SetFocus(ui.logView)
-				ui.updateTitlesDirect("log")
+				// log gains focus → double line separators
+				ui.setLogSeparators(true)
 			}
 			return nil
 
 		case tcell.KeyBacktab: // Shift+Tab reverse
 			if ui.app.GetFocus() == ui.inputField {
 				ui.app.SetFocus(ui.logView)
-				ui.updateTitlesDirect("log")
+				ui.setLogSeparators(true)
 			} else {
 				ui.app.SetFocus(ui.inputField)
-				ui.updateTitlesDirect("input")
+				ui.setLogSeparators(false)
 			}
 			return nil
 
-		case tcell.KeyCtrlL:
-			if ui.app.GetFocus() == ui.inputField {
-				ui.inputField.SetText("")
-				return nil
-			}
-
 		case tcell.KeyCtrlC:
-			// ALWAYS exit (regardless of focus)
-			exitNow(130)
+			// Hard exit: stop UI and signal INT to self so the server loop exits too.
+			ui.app.EnableMouse(false)
+			ui.app.Stop()
+			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
 			return nil
 
 		case tcell.KeyRune:
+			// NOTE: global runes (q, m, space, ?, etc.) should only act when log view is focused.
 			switch ev.Rune() {
 			case 'q', 'Q':
-				// Exit only when NOT typing in the input field
-				if ui.app.GetFocus() != ui.inputField {
-					exitNow(0)
+				if ui.app.GetFocus() == ui.logView {
+					ui.app.EnableMouse(false)
+					ui.app.Stop()
+					_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
 					return nil
 				}
-				return ev // allow typing q/Q in input
-
-			case '/':
-				ui.app.SetFocus(ui.inputField)
-				ui.updateTitlesDirect("input")
-				return nil
-
 			case 'm':
-				// Toggle mouse only when NOT in the input field
-				if ui.app.GetFocus() != ui.inputField {
+				if ui.app.GetFocus() == ui.logView {
 					ui.mu.Lock()
 					ui.mouseOn = !ui.mouseOn
 					on := ui.mouseOn
 					ui.mu.Unlock()
 					ui.app.EnableMouse(on)
-					ui.updateStatusDirect()
 					return nil
 				}
-				return ev // allow typing 'm' in input
-
-			case 'c', 'C':
-				// Toggle case only when NOT in the input field
-				if ui.app.GetFocus() != ui.inputField {
-					ui.mu.Lock()
-					ui.filterCaseSensitive = !ui.filterCaseSensitive
-					ui.mu.Unlock()
-					ui.updateStatusDirect()
-					ui.refreshDirect()
+			case '?':
+				if ui.app.GetFocus() == ui.logView {
+					// (Your modal toggling code goes here; omitted since not related to the crash)
 					return nil
 				}
-				return ev // allow typing c/C in input
-
 			case ' ':
 				// Pause/resume only when NOT in the input field
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
-					wasPaused := ui.paused
 					ui.paused = !ui.paused
-					nowPaused := ui.paused
 					ui.mu.Unlock()
-					ui.updateStatusDirect()
-
-					// If we just RESUMED, immediately render buffered lines and jump to end.
-					if wasPaused && !nowPaused {
-						ui.refreshDirect()
-						ui.logView.ScrollToEnd()
-					}
 					return nil
 				}
-				return ev // allow space in input
+			case 'c':
+				// Toggle case only when NOT in the input field (so 'c' can be typed in the filter)
+				if ui.app.GetFocus() != ui.inputField {
+					ui.mu.Lock()
+					ui.filterCaseSensitive = !ui.filterCaseSensitive
+					ui.mu.Unlock()
+					ui.refreshDirect()
+					return nil
+				}
 			}
-
 		case tcell.KeyUp:
-			row, col := ui.logView.GetScrollOffset()
-			if row > 0 {
-				ui.logView.ScrollTo(row-1, col)
+			if ui.app.GetFocus() == ui.logView {
+				row, col := ui.logView.GetScrollOffset()
+				if row > 0 {
+					ui.logView.ScrollTo(row-1, col)
+				}
+				return nil
 			}
-			return nil
-
 		case tcell.KeyDown:
-			row, col := ui.logView.GetScrollOffset()
-			ui.logView.ScrollTo(row+1, col)
-			return nil
-
+			if ui.app.GetFocus() == ui.logView {
+				row, col := ui.logView.GetScrollOffset()
+				ui.logView.ScrollTo(row+1, col)
+				return nil
+			}
 		case tcell.KeyPgUp:
-			_, _, _, h := ui.logView.GetInnerRect()
-			if h < 1 {
-				h = 1
+			if ui.app.GetFocus() == ui.logView {
+				_, _, _, h := ui.logView.GetInnerRect()
+				if h < 1 {
+					h = 1
+				}
+				row, col := ui.logView.GetScrollOffset()
+				nr := row - (h - 1)
+				if nr < 0 {
+					nr = 0
+				}
+				ui.logView.ScrollTo(nr, col)
+				return nil
 			}
-			row, col := ui.logView.GetScrollOffset()
-			nr := row - (h - 1)
-			if nr < 0 {
-				nr = 0
-			}
-			ui.logView.ScrollTo(nr, col)
-			return nil
-
 		case tcell.KeyPgDn:
-			_, _, _, h := ui.logView.GetInnerRect()
-			if h < 1 {
-				h = 1
+			if ui.app.GetFocus() == ui.logView {
+				_, _, _, h := ui.logView.GetInnerRect()
+				if h < 1 {
+					h = 1
+				}
+				row, col := ui.logView.GetScrollOffset()
+				ui.logView.ScrollTo(row+(h-1), col)
+				return nil
 			}
-			row, col := ui.logView.GetScrollOffset()
-			ui.logView.ScrollTo(row+(h-1), col)
-			return nil
-
 		case tcell.KeyHome:
-			ui.logView.ScrollToBeginning()
-			return nil
-
+			if ui.app.GetFocus() == ui.logView {
+				ui.logView.ScrollToBeginning()
+				return nil
+			}
 		case tcell.KeyEnd:
-			ui.logView.ScrollToEnd()
-			return nil
+			if ui.app.GetFocus() == ui.logView {
+				ui.logView.ScrollToEnd()
+				return nil
+			}
 		}
 		return ev
 	})
 }
 
-// updateTitlesDirect updates titles directly on the UI goroutine.
-func (ui *ConsoleUI) updateTitlesDirect(focus string) {
-	if focus != ui.lastFocus {
-		if focus == "log" {
-			ui.logView.SetTitle(" [::b]logs[::-] ")
-			ui.bottomBox.SetTitle(" console ")
-		} else {
-			ui.logView.SetTitle(" logs ")
-			ui.bottomBox.SetTitle(" [::b]console[::-] ")
+// visualLen returns an approximate printable length by stripping simple tview [tag] blocks.
+func visualLen(s string) int {
+	inTag := false
+	n := 0
+	for _, r := range s {
+		switch r {
+		case '[':
+			inTag = true
+		case ']':
+			if inTag {
+				inTag = false
+			} else {
+				n++ // stray ']' counts
+			}
+		default:
+			if !inTag {
+				n++
+			}
 		}
-		ui.lastFocus = focus
 	}
+	return n
 }
 
-// updateStatusDirect updates the status/help line directly.
-// Call this ONLY from the UI goroutine (e.g., inside widget callbacks).
-func (ui *ConsoleUI) updateStatusDirect() {
-	ui.statusText.Clear()
-
-	ui.mu.Lock()
-	mouseOn := ui.mouseOn
-	filterOn := ui.filterActive
-	caseOn := ui.filterCaseSensitive
-	paused := ui.paused
-	nc := ui.nocolour
-	ui.mu.Unlock()
-
-	mouse := "Off"
-	filter := "Off"
-	cs := "Off"
-	pause := "Running"
-	if mouseOn {
-		mouse = "On"
-	}
-	if filterOn {
-		filter = "Active"
-	}
-	if caseOn {
-		cs = "On"
-	}
-	if paused {
-		pause = "Paused"
-	}
-
-	if nc {
-		// No color: plain text but same structure
-		ui.statusText.SetText(
-			fmt.Sprintf("Home/End top/bottom · ↑/↓ PgUp/PgDn scroll · space pause · Tab focus · mouse:%s · filter:%s · case:%s · esc clear · q quit · %s",
-				mouse, filter, cs, pause))
+func (ui *ConsoleUI) updateTitlesDirect(focus string) {
+	if focus == ui.lastFocus {
 		return
 	}
-
-	// Colored keys in blue, states colored as before
-	ui.statusText.SetText(
-		fmt.Sprintf("[blue]Home[-]/[blue]End[-] top/bottom · [blue]↑[-]/[blue]↓[-] [blue]PgUp[-]/[blue]PgDn[-] scroll · [blue]space[-] pause · [blue]Tab[-] focus · [blue]m[-]ouse:[green]%s[-] · filter:[yellow]%s[-] · [blue]c[-]ase:[magenta]%s[-] · [blue]esc[-] clear · [blue]q[-] quit · [cyan]%s[-]",
-			mouse, filter, cs, pause))
+	// Update “borders” based on focus: double lines when log is focused
+	ui.setLogSeparators(focus == "log")
+	ui.lastFocus = focus
 }
 
 // refreshDirect repaints the log view directly.
@@ -772,6 +714,10 @@ func (ui *ConsoleUI) refreshDirect() {
 	for _, l := range ui.filteredLines() {
 		fmt.Fprintln(ui.logView, l)
 	}
+	// Keep separators width/form when we repaint
+	ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
+	// Bottom bar may need an update (e.g., case toggle)
+	ui.updateBottomBarDirect()
 }
 
 // Start starts the console UI.
@@ -789,30 +735,141 @@ func (ui *ConsoleUI) Stop() {
 	ui.app.Stop()
 }
 
+// setLogSeparators draws single ('─') or double ('═') lines to simulate top/bottom borders.
+func (ui *ConsoleUI) setLogSeparators(focused bool) {
+	// Be nil-safe: if these aren't ready yet, just return.
+	if ui.logView == nil || ui.topSep == nil || ui.bottomSep == nil {
+		return
+	}
+
+	// Use the log view width; GetScreen() isn't available on recent tview.
+	_, _, w, _ := ui.logView.GetInnerRect()
+	if w <= 0 {
+		w = 1
+	}
+
+	ch := '─'
+	if focused {
+		ch = '═'
+	}
+	line := strings.Repeat(string(ch), w)
+
+	ui.topSep.SetText(line)
+	ui.bottomSep.SetText(line)
+}
+
+// updateBottomBarDirect updates the 2nd line under the input with help + live RPM/APM.
+func (ui *ConsoleUI) updateBottomBarDirect() {
+	ui.mu.Lock()
+	rpm := len(ui.reqTimes)
+	apm := len(ui.ackTimes)
+	mouseOn := ui.mouseOn
+	filterOn := ui.filterActive
+	caseOn := ui.filterCaseSensitive
+	paused := ui.paused
+	nc := ui.nocolour
+	ui.mu.Unlock()
+
+	// Left segment (keys), with blue for keys
+	key := func(s string) string {
+		if nc {
+			return s
+		}
+		return "[blue::b]" + s + "[-:-:-]"
+	}
+	left := fmt.Sprintf("%s help | %s switch focus | %s quit | RPM: %d | APM: %d",
+		key("?"), key("Tab"), key("Ctrl+C"), rpm, apm)
+
+	// Right segment (statuses): green when "active", yellow when not
+	col := func(active bool, label string) string {
+		if nc {
+			return label
+		}
+		if active {
+			return "[green::b]" + label + "[-:-:-]"
+		}
+		return "[yellow]" + label + "[-]"
+	}
+	// Running is "active" when not paused
+	right := fmt.Sprintf("%s | %s | %s | %s",
+		col(filterOn, "Filter"),
+		col(caseOn, "Case Sensitive"),
+		col(mouseOn, "Mouse"),
+		col(!paused, "Running"),
+	)
+
+	// Align right: pad spaces between left and right to fit width
+	_, _, w, _ := ui.statusText.GetInnerRect()
+	if w <= 0 {
+		// Fallback: just concatenate
+		ui.statusText.SetText(left + "  " + right)
+		return
+	}
+	pad := w - visualLen(left) - visualLen(right)
+	if pad < 1 {
+		pad = 1
+	}
+	ui.statusText.SetText(left + strings.Repeat(" ", pad) + right)
+}
+
 // Append appends one line, respecting pause and autoscroll, with bounded ring buffer.
 func (ui *ConsoleUI) Append(line string) {
+	now := time.Now()
+
+	// Track rates (REQUESTS per minute, ACKS per minute) from incoming lines
+	isReq := strings.Contains(line, "REQUEST")
+	isAck := strings.Contains(line, "ACK")
 	ui.mu.Lock()
 	ui.lines = append(ui.lines, line)
 	if len(ui.lines) > ui.maxLines {
 		excess := len(ui.lines) - ui.maxLines
 		ui.lines = ui.lines[excess:]
 	}
+	// Sliding 60s windows
+	cut := now.Add(-60 * time.Second)
+	if isReq {
+		ui.reqTimes = append(ui.reqTimes, now)
+	}
+	if isAck {
+		ui.ackTimes = append(ui.ackTimes, now)
+	}
+	// prune
+	i := 0
+	for _, t := range ui.reqTimes {
+		if t.After(cut) {
+			break
+		}
+		i++
+	}
+	if i > 0 && i <= len(ui.reqTimes) {
+		ui.reqTimes = ui.reqTimes[i:]
+	}
+	j := 0
+	for _, t := range ui.ackTimes {
+		if t.After(cut) {
+			break
+		}
+		j++
+	}
+	if j > 0 && j <= len(ui.ackTimes) {
+		ui.ackTimes = ui.ackTimes[j:]
+	}
 	paused := ui.paused
 	ui.mu.Unlock()
 
-	if paused {
-		return
-	}
-
+	// Update UI
 	ui.Do(func() {
-		atBottom := ui.atBottom()
-		ui.logView.Clear()
-		for _, l := range ui.filteredLines() {
-			fmt.Fprintln(ui.logView, l)
+		if !paused {
+			atBottom := ui.atBottom()
+			ui.logView.Clear()
+			for _, l := range ui.filteredLines() {
+				fmt.Fprintln(ui.logView, l)
+			}
+			if atBottom {
+				ui.logView.ScrollToEnd()
+			}
 		}
-		if atBottom {
-			ui.logView.ScrollToEnd()
-		}
+		ui.updateBottomBarDirect()
 	})
 }
 
@@ -2422,12 +2479,21 @@ func main() {
 		console       bool
 		pidPath       string
 		nocolour      bool
+		showVersion   bool // <— ADD
 	)
 
 	root := &cobra.Command{
 		Use:   "dhcplane",
 		Short: "DHCPv4 server (insomniacslk/dhcp) with JSON config, reservations (with notes), logging, sticky leases, stats, and live reload",
+		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+			if showVersion {
+				fmt.Println(appVersion)
+				os.Exit(0)
+			}
+			return nil
+		},
 	}
+	root.PersistentFlags().BoolVarP(&showVersion, "version", "v", false, "Print version and exit")
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.json", "Path to JSON config")
 	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
 	root.PersistentFlags().BoolVar(&authoritative, "authoritative", true, "Send NAKs on invalid requests")
