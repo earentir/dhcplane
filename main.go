@@ -520,18 +520,15 @@ func (ui *ConsoleUI) bindKeys() {
 	ui.inputField.SetDoneFunc(func(key tcell.Key) {
 		switch key {
 		case tcell.KeyEnter:
-			// Toggle filter state; DO NOT clear the text when disabling
 			ui.mu.Lock()
 			txt := ui.inputField.GetText()
 			if ui.filterActive {
 				ui.filterActive = false
-				// keep ui.filter and input text intact so user can re-enable quickly
 			} else {
 				ui.filterActive = true
 				ui.filter = txt
 			}
 			ui.mu.Unlock()
-
 			ui.updateStatusDirect()
 			ui.refreshDirect()
 
@@ -539,13 +536,23 @@ func (ui *ConsoleUI) bindKeys() {
 			ui.mu.Lock()
 			ui.filterActive = false
 			ui.filter = ""
-			ui.inputField.SetText("") // explicit clear via Esc
+			ui.inputField.SetText("")
 			ui.mu.Unlock()
-
 			ui.updateStatusDirect()
 			ui.refreshDirect()
 		}
 	})
+
+	// Helper: stop UI and exit process (works on all OSes)
+	exitNow := func(code int) {
+		ui.app.EnableMouse(false)
+		ui.app.Stop()
+		// exit on a separate goroutine so tcell can restore the terminal first
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			os.Exit(code)
+		}()
+	}
 
 	// Global keymap — runs on the UI goroutine
 	ui.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
@@ -577,37 +584,24 @@ func (ui *ConsoleUI) bindKeys() {
 			}
 
 		case tcell.KeyCtrlC:
-			ui.app.EnableMouse(false)
-			ui.app.Stop()
-			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+			// ALWAYS exit (regardless of focus)
+			exitNow(130)
 			return nil
 
 		case tcell.KeyRune:
-			// When input is focused, let q/Q, m, space, c/C pass through to the input field
-			if ui.app.GetFocus() == ui.inputField {
-				switch ev.Rune() {
-				case 'q', 'Q', 'm', ' ', 'c', 'C':
-					return ev // allow typing into input
-				}
-			}
-
 			switch ev.Rune() {
+			case 'q', 'Q':
+				// ALWAYS exit (regardless of focus)
+				exitNow(0)
+				return nil
+
 			case '/':
 				ui.app.SetFocus(ui.inputField)
 				ui.updateTitlesDirect("input")
 				return nil
 
-			case 'q', 'Q':
-				// Only quit when NOT in input
-				if ui.app.GetFocus() != ui.inputField {
-					ui.app.EnableMouse(false)
-					ui.app.Stop()
-					_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
-					return nil
-				}
-				return ev
-
-			case 'm': // toggle tview mouse handling
+			case 'm':
+				// Only toggle mouse when NOT typing in the input
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
 					ui.mouseOn = !ui.mouseOn
@@ -617,9 +611,10 @@ func (ui *ConsoleUI) bindKeys() {
 					ui.updateStatusDirect()
 					return nil
 				}
-				return ev
+				return ev // allow typing 'm' in input
 
-			case 'c', 'C': // toggle case sensitivity for filter
+			case 'c', 'C':
+				// Only toggle case when NOT typing in the input
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
 					ui.filterCaseSensitive = !ui.filterCaseSensitive
@@ -628,10 +623,10 @@ func (ui *ConsoleUI) bindKeys() {
 					ui.refreshDirect()
 					return nil
 				}
-				return ev
+				return ev // allow typing c/C in input
 
 			case ' ':
-				// Pause/resume only when NOT in the input field
+				// Pause only when NOT in input
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
 					ui.paused = !ui.paused
@@ -639,7 +634,7 @@ func (ui *ConsoleUI) bindKeys() {
 					ui.updateStatusDirect()
 					return nil
 				}
-				return ev
+				return ev // allow space in input
 			}
 
 		case tcell.KeyUp:
