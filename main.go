@@ -516,6 +516,19 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 func (ui *ConsoleUI) Do(fn func()) { ui.app.QueueUpdateDraw(fn) }
 
 func (ui *ConsoleUI) bindKeys() {
+	// Live update the filter as the user types (only when filter is active)
+	ui.inputField.SetChangedFunc(func(text string) {
+		ui.mu.Lock()
+		active := ui.filterActive
+		ui.mu.Unlock()
+		if active {
+			ui.mu.Lock()
+			ui.filter = text
+			ui.mu.Unlock()
+			ui.refreshDirect() // repaint immediately with the new filter
+		}
+	})
+
 	// Input behaviors — runs on tview's UI goroutine
 	ui.inputField.SetDoneFunc(func(key tcell.Key) {
 		switch key {
@@ -523,6 +536,7 @@ func (ui *ConsoleUI) bindKeys() {
 			ui.mu.Lock()
 			txt := ui.inputField.GetText()
 			if ui.filterActive {
+				// keep text; just deactivate the filter
 				ui.filterActive = false
 			} else {
 				ui.filterActive = true
@@ -547,7 +561,6 @@ func (ui *ConsoleUI) bindKeys() {
 	exitNow := func(code int) {
 		ui.app.EnableMouse(false)
 		ui.app.Stop()
-		// exit on a separate goroutine so tcell can restore the terminal first
 		go func() {
 			time.Sleep(25 * time.Millisecond)
 			os.Exit(code)
@@ -626,12 +639,20 @@ func (ui *ConsoleUI) bindKeys() {
 				return ev // allow typing c/C in input
 
 			case ' ':
-				// Pause only when NOT in input
+				// Pause/resume only when NOT in the input field
 				if ui.app.GetFocus() != ui.inputField {
 					ui.mu.Lock()
+					wasPaused := ui.paused
 					ui.paused = !ui.paused
+					nowPaused := ui.paused
 					ui.mu.Unlock()
 					ui.updateStatusDirect()
+
+					// If we just RESUMED, immediately render buffered lines and jump to end.
+					if wasPaused && !nowPaused {
+						ui.refreshDirect()
+						ui.logView.ScrollToEnd()
+					}
 					return nil
 				}
 				return ev // allow space in input
