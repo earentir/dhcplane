@@ -170,6 +170,15 @@ The server loads a strict JSON file (unknown fields are rejected). On `serve` st
 ```
 
 Defaults:
+Defaults:
+
+- `lease_seconds`: `86400` (24h) if ≤ 0
+- `lease_sticky_seconds`: `86400` (sticky window) if ≤ 0
+- At least one pool is required
+- Unknown fields are rejected (strict mode)
+
+### Example config
+
 - `lease_seconds`: `86400` (24h) if ≤ 0
 - `lease_sticky_seconds`: `86400` (sticky window) if ≤ 0
 - At least one pool is required
@@ -232,6 +241,7 @@ Defaults:
 
 Banned MACs can be declared in config under `banned_macs` (with optional metadata), **and/or** via env var `dhcplane_BANNED_MACS` (comma/space/newline-separated list, any delimiter style, e.g. `aabbccddeeff`, `aa:bb:...`, `aa-bb-...`).
 Banned MACs:
+
 - Are logged on contact
 - Receive a NAK to requests if `--authoritative` is enabled
 - Are marked in the **grid** and **details** outputs
@@ -239,6 +249,7 @@ Banned MACs:
 ### Per-device overrides
 
 `device_overrides` lets you override **only**:
+
 - DNS servers (option 6)
 - TFTP server name (66)
 - Bootfile name (67)
@@ -368,6 +379,7 @@ Remove a reservation:
 Start the DHCP server. Validates config before binding. Creates/updates a PID file. Supports `SIGHUP` reload and graceful termination.
 
 Key features at runtime:
+
 - Sticky leases
 - Reservation enforcement over leases
 - Per-device overrides (DNS/TFTP/Bootfile)
@@ -385,6 +397,7 @@ Print leases from `leases.json` as a JSON array with formatted timestamps (local
 Print allocation rates for the last 1m/1h/24h/7d/30d and lease groupings.
 
 Flags:
+
 - `--details`: show a unified table across the whole subnet with Type classification:
   - `leased` (active leases)
   - `reserved` (IP is fixed in config, not currently leased)
@@ -469,7 +482,7 @@ When `auto_reload` is true, the process also watches the config file’s directo
 
 Example log lines:
 
-```
+```log
 START iface="" bind=0.0.0.0:67 server_ip=192.168.178.1 subnet=192.168.178.0/24 gateway=192.168.178.1 lease=24h0m0s sticky=24h0m0s
 AUTO-RELOAD: watching ./config.json
 DISCOVER from aa:bb:cc:dd:ee:ff hostname="printer" xid=0x12345678
