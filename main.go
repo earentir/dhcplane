@@ -428,16 +428,18 @@ func (db *LeaseDB) compactNow(grace time.Duration) int {
 
 // ConsoleUI represents the interactive console UI using tview.
 type ConsoleUI struct {
-	app        *tview.Application
-	logView    *tview.TextView
-	inputField *tview.InputField
-	topSep     *tview.TextView
-	bottomSep  *tview.TextView
-	statusText *tview.TextView
-	bottomBox  *tview.Flex
-	reqTimes   []time.Time
-	ackTimes   []time.Time
-
+	app                 *tview.Application
+	logView             *tview.TextView
+	inputField          *tview.InputField
+	topSep              *tview.TextView
+	bottomSep           *tview.TextView
+	statusText          *tview.TextView
+	bottomBox           *tview.Flex
+	root                tview.Primitive // root layout to restore after modal
+	modal               tview.Primitive // currently open modal (if any)
+	prevFocus           tview.Primitive // previous focused primitive before opening modal
+	reqTimes            []time.Time
+	ackTimes            []time.Time
 	mu                  sync.Mutex
 	lines               []string // ring buffer content
 	maxLines            int      // buffer cap
@@ -447,8 +449,6 @@ type ConsoleUI struct {
 	paused              bool
 	nocolour            bool
 	mouseOn             bool
-
-	lastFocus string // "log" or "input"
 }
 
 // NewConsoleUI builds the interactive console using tview.
@@ -461,7 +461,7 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 		app:      app,
 		nocolour: nocolour,
 		maxLines: maxLines,
-		mouseOn:  false, // start with terminal-native drag-to-copy
+		mouseOn:  true, // start with mouse ON by default
 	}
 
 	// Main log view
@@ -475,37 +475,45 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 	ui.topSep = tview.NewTextView().SetWrap(false)
 	ui.bottomSep = tview.NewTextView().SetWrap(false)
 
-	// Input field (single line at the bottom)
+	// Input field (single line)
 	input := tview.NewInputField().
 		SetLabel("> ").
 		SetFieldWidth(0)
 	ui.inputField = input
 
-	// Bottom container (just the input; no borders)
+	// Status line under the input (shows help + RPM/APM + toggles)
+	status := tview.NewTextView().
+		SetWrap(false).
+		SetDynamicColors(!nocolour)
+	ui.statusText = status
+
+	// Bottom container: input (focusable) + status (non-focusable)
 	bottom := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(input, 1, 0, true)
+		AddItem(input, 1, 0, true).
+		AddItem(status, 1, 0, false)
 	ui.bottomBox = bottom
 
-	// Root layout: top sep, log, bottom sep, then input
+	// Root layout: top sep, log, bottom sep, then bottom box
 	root := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(ui.topSep, 1, 0, false).
 		AddItem(logView, 0, 1, false).
 		AddItem(ui.bottomSep, 1, 0, false).
-		AddItem(bottom, 1, 0, true)
+		AddItem(bottom, 2, 0, true)
+	ui.root = root // <— IMPORTANT: remember root so modals can restore it
 
 	// Key bindings
 	ui.bindKeys()
 
 	// Initial focus: input line active
-	ui.lastFocus = "input"
-	ui.app.EnableMouse(false)
+	ui.app.EnableMouse(true) // reflect default mouseOn=true
 	ui.app.SetRoot(root, true)
 	ui.app.SetFocus(input)
 
-	// Set initial separators (single for unfocused log)
-	ui.setLogSeparators(false)
+	// Initial separators and status bar
+	ui.setLogSeparators(false) // input has focus
+	ui.updateBottomBarDirect()
 
 	return ui
 }
@@ -513,10 +521,22 @@ func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
 // Do schedules a UI update on tview's UI goroutine.
 func (ui *ConsoleUI) Do(fn func()) { ui.app.QueueUpdateDraw(fn) }
 
-// bindKeys wires all key handling. Global keys act only when the log view is focused.
 // Input-line keys are handled via the input field callbacks.
 // bindKeys wires global and input-specific key handling.
 func (ui *ConsoleUI) bindKeys() {
+	// Live filter update while typing — only when filter is active.
+	ui.inputField.SetChangedFunc(func(text string) {
+		ui.mu.Lock()
+		active := ui.filterActive
+		if active {
+			ui.filter = text
+		}
+		ui.mu.Unlock()
+		if active {
+			ui.refreshDirect() // repaint with current filter
+		}
+	})
+
 	// Input behaviors — runs on tview's UI goroutine
 	ui.inputField.SetDoneFunc(func(key tcell.Key) {
 		switch key {
@@ -532,8 +552,6 @@ func (ui *ConsoleUI) bindKeys() {
 				ui.filter = txt
 			}
 			ui.mu.Unlock()
-
-			// repaint
 			ui.refreshDirect()
 
 		case tcell.KeyEsc:
@@ -542,11 +560,19 @@ func (ui *ConsoleUI) bindKeys() {
 			ui.filter = ""
 			ui.inputField.SetText("") // explicit clear via Esc
 			ui.mu.Unlock()
-
-			// repaint
 			ui.refreshDirect()
 		}
 	})
+
+	// Helper: stop UI and exit process (works on all OSes)
+	exitNow := func(code int) {
+		ui.app.EnableMouse(false)
+		ui.app.Stop()
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			os.Exit(code)
+		}()
+	}
 
 	// Global keymap — runs on the UI goroutine
 	ui.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
@@ -554,11 +580,9 @@ func (ui *ConsoleUI) bindKeys() {
 		case tcell.KeyTab: // cycle focus: log <-> input
 			if ui.app.GetFocus() == ui.logView {
 				ui.app.SetFocus(ui.inputField)
-				// log loses focus → single line separators
 				ui.setLogSeparators(false)
 			} else {
 				ui.app.SetFocus(ui.logView)
-				// log gains focus → double line separators
 				ui.setLogSeparators(true)
 			}
 			return nil
@@ -574,22 +598,20 @@ func (ui *ConsoleUI) bindKeys() {
 			return nil
 
 		case tcell.KeyCtrlC:
-			// Hard exit: stop UI and signal INT to self so the server loop exits too.
-			ui.app.EnableMouse(false)
-			ui.app.Stop()
-			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+			// ALWAYS exit (regardless of focus)
+			exitNow(130)
 			return nil
 
 		case tcell.KeyRune:
-			// NOTE: global runes (q, m, space, ?, etc.) should only act when log view is focused.
 			switch ev.Rune() {
 			case 'q', 'Q':
-				if ui.app.GetFocus() == ui.logView {
-					ui.app.EnableMouse(false)
-					ui.app.Stop()
-					_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+				// Exit only when NOT typing in the input field
+				if ui.app.GetFocus() != ui.inputField {
+					exitNow(0)
 					return nil
 				}
+				return ev // allow typing q/Q in input
+
 			case 'm':
 				if ui.app.GetFocus() == ui.logView {
 					ui.mu.Lock()
@@ -597,11 +619,12 @@ func (ui *ConsoleUI) bindKeys() {
 					on := ui.mouseOn
 					ui.mu.Unlock()
 					ui.app.EnableMouse(on)
+					ui.updateBottomBarDirect() // immediately reflect green/yellow
 					return nil
 				}
 			case '?':
 				if ui.app.GetFocus() == ui.logView {
-					// (Your modal toggling code goes here; omitted since not related to the crash)
+					ui.showHelpModal()
 					return nil
 				}
 			case ' ':
@@ -610,6 +633,7 @@ func (ui *ConsoleUI) bindKeys() {
 					ui.mu.Lock()
 					ui.paused = !ui.paused
 					ui.mu.Unlock()
+					ui.updateBottomBarDirect()
 					return nil
 				}
 			case 'c':
@@ -675,6 +699,88 @@ func (ui *ConsoleUI) bindKeys() {
 	})
 }
 
+// helpText returns the formatted, sectioned help used by the modal
+func (ui *ConsoleUI) helpText() string {
+	key := func(s string) string {
+		if ui.nocolour {
+			return s
+		}
+		return "[blue::b]" + s + "[-:-:-]"
+	}
+	sec := func(s string) string {
+		if ui.nocolour {
+			return s
+		}
+		return "[::b]" + s + "[-:-:-]"
+	}
+
+	return strings.Join([]string{
+		sec("DHCPlane Console — Shortcuts & Help"),
+		"",
+		sec("Focus & Quit"),
+		"  " + key("Tab") + " / " + key("Shift+Tab") + "  Switch focus (Log ↔ Input)",
+		"  " + key("Ctrl+C") + "               Quit immediately",
+		"  " + key("q") + " (log focus)       Quit",
+		"",
+		sec("Log View (when focused)"),
+		"  " + key("Up/Down") + "              Scroll one line",
+		"  " + key("PgUp/PgDn") + "            Scroll one page",
+		"  " + key("Home/End") + "             Jump to top/bottom",
+		"  " + key("Space") + "                Pause/Resume autoscroll",
+		"  " + key("c") + "                    Toggle case sensitivity for filter",
+		"  " + key("m") + "                    Toggle mouse support",
+		"  " + key("?") + "                    Toggle this help",
+		"",
+		sec("Filter (Input line)"),
+		"  Type any text to set the filter pattern",
+		"  " + key("Enter") + "                 Enable/Disable filter (keeps text)",
+		"  " + key("Esc") + "                   Clear & disable filter",
+		"",
+		sec("Status Bar"),
+		"  Shows " + key("RPM") + " (REQUESTS/min), " + key("APM") + " (ACKS/min), and toggles:",
+		"   • Filter, Case Sensitive, Mouse, Running",
+		"",
+		sec("Notes"),
+		"  Colour tags appear only in console; the log file remains plain.",
+	}, "\n")
+}
+
+// showHelpModal builds and displays the help modal, remembering focus.
+func (ui *ConsoleUI) showHelpModal() {
+	// Remember current focus so we can restore exactly.
+	ui.prevFocus = ui.app.GetFocus()
+
+	// Use the rich help text.
+	help := ui.helpText()
+
+	m := tview.NewModal().
+		SetText(help).
+		AddButtons([]string{"Close"}).
+		SetDoneFunc(func(_ int, _ string) {
+			ui.closeModal()
+		})
+
+	// While the modal is up, swallow keys except close keys (handled in SetDoneFunc / your input capture).
+	ui.modal = m
+	ui.app.SetRoot(m, true)
+	ui.app.SetFocus(m)
+}
+
+// closeModal closes the help modal and restores the full UI and previous focus.
+func (ui *ConsoleUI) closeModal() {
+	if ui.modal == nil {
+		return
+	}
+	ui.modal = nil
+	// Restore the full UI and the exact widget that had focus.
+	ui.app.SetRoot(ui.root, true)
+	if ui.prevFocus != nil {
+		ui.app.SetFocus(ui.prevFocus)
+		// Update separators according to the real focused widget.
+		ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
+	}
+}
+
 // visualLen returns an approximate printable length by stripping simple tview [tag] blocks.
 func visualLen(s string) int {
 	inTag := false
@@ -698,13 +804,10 @@ func visualLen(s string) int {
 	return n
 }
 
-func (ui *ConsoleUI) updateTitlesDirect(focus string) {
-	if focus == ui.lastFocus {
-		return
-	}
-	// Update “borders” based on focus: double lines when log is focused
-	ui.setLogSeparators(focus == "log")
-	ui.lastFocus = focus
+// updateTitlesDirect ensures separators match the actual focused widget.
+// Call this ONLY from the UI goroutine if you decide to use it.
+func (ui *ConsoleUI) updateTitlesDirect() {
+	ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
 }
 
 // refreshDirect repaints the log view directly.
@@ -788,7 +891,7 @@ func (ui *ConsoleUI) updateBottomBarDirect() {
 		if active {
 			return "[green::b]" + label + "[-:-:-]"
 		}
-		return "[yellow]" + label + "[-]"
+		return "[yellow]" + label + "[-:-:-]"
 	}
 	// Running is "active" when not paused
 	right := fmt.Sprintf("%s | %s | %s | %s",
