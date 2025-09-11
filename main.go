@@ -804,12 +804,6 @@ func visualLen(s string) int {
 	return n
 }
 
-// updateTitlesDirect ensures separators match the actual focused widget.
-// Call this ONLY from the UI goroutine if you decide to use it.
-func (ui *ConsoleUI) updateTitlesDirect() {
-	ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
-}
-
 // refreshDirect repaints the log view directly.
 // Call this ONLY from the UI goroutine (e.g., inside widget callbacks).
 func (ui *ConsoleUI) refreshDirect() {
