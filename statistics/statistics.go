@@ -42,7 +42,7 @@ type LeaseView struct {
 // DetailRow is the unified row for the full subnet scan with Type.
 type DetailRow struct {
 	IP          string
-	Type        string // leased | reserved | banned-mac | banned-ip | free
+	Type        string // leased | reserved | banned-mac | banned-ip | free | unused
 	MAC         string
 	Hostname    string
 	AllocatedAt int64
@@ -122,8 +122,8 @@ func ClassifyLeases(iter LeaseIter, assumeLeaseDur time.Duration, now time.Time)
 
 /* ----------------- Detail rows (full subnet walk) ----------------- */
 
-// BuildDetailRows walks the whole host range and classifies every IP into the
-// same types used by the grid: "leased", "reserved", "banned-mac", "banned-ip", or "free".
+// BuildDetailRows walks the whole host range and classifies every IP.
+// Types: "leased", "reserved", "banned-mac", "banned-ip", "free" (in pools), "unused" (outside pools).
 // It fills MAC/Hostname/AllocatedAt/Expiry when available (leased rows).
 func BuildDetailRows(
 	cfg config.Config,
@@ -144,6 +144,31 @@ func BuildDetailRows(
 	bcast := broadcastAddr(ipnet)
 	first := incIP(network)
 	last := u32ToIP(ipToU32(bcast) - 1)
+
+	// Precompute pool ranges
+	type urange struct{ a, b uint32 }
+	var pools []urange
+	for _, p := range cfg.Pools {
+		start := net.ParseIP(strings.TrimSpace(p.Start)).To4()
+		end := net.ParseIP(strings.TrimSpace(p.End)).To4()
+		if start == nil || end == nil {
+			continue
+		}
+		as := ipToU32(start)
+		be := ipToU32(end)
+		if be < as {
+			as, be = be, as
+		}
+		pools = append(pools, urange{a: as, b: be})
+	}
+	inPools := func(u uint32) bool {
+		for _, r := range pools {
+			if u >= r.a && u <= r.b {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Active leases (unexpired)
 	active := make(map[string]LeaseLite)
@@ -202,6 +227,7 @@ func BuildDetailRows(
 		isSpecial := (serverIP != nil && ip.Equal(serverIP)) ||
 			(gatewayIP != nil && ip.Equal(gatewayIP)) ||
 			ip.Equal(network) || ip.Equal(bcast)
+		inPool := inPools(u)
 
 		if l, ok := active[s]; ok {
 			if activeBanned[s] {
@@ -223,6 +249,8 @@ func BuildDetailRows(
 			rows = append(rows, DetailRow{IP: s, Type: "banned-ip"})
 		case isRes:
 			rows = append(rows, DetailRow{IP: s, Type: "reserved", MAC: resMAC})
+		case !inPool:
+			rows = append(rows, DetailRow{IP: s, Type: "unused"})
 		default:
 			rows = append(rows, DetailRow{IP: s, Type: "free"})
 		}
@@ -318,7 +346,8 @@ func PrintDetailsTable(title string, rows []DetailRow, assumeLeaseDur time.Durat
 //	brown     █ = reserved/fixed (from config.reservations; only if not actively leased)
 //	dark gray █ = banned/unusable IPs (exclusions, network/broadcast/server/gateway, declined)
 //	light gray█ = banned MAC leases (active leases owned by banned MACs)
-//	green     █ = free host IP inside the configured subnet
+//	green     █ = free host IP inside the configured pools
+//	cyan      █ = unused host IP outside all configured pools
 func DrawSubnetGrid(
 	cfg config.Config,
 	iter LeaseIter,
@@ -336,6 +365,7 @@ func DrawSubnetGrid(
 	blkBannedIP := aurora.Gray(8, "█")   // dark gray
 	blkBannedMAC := aurora.Gray(14, "█") // light gray
 	blkFree := aurora.Green("█")
+	blkUnused := aurora.Cyan("█")
 
 	_, ipnet, err := net.ParseCIDR(cfg.SubnetCIDR)
 	if err != nil {
@@ -348,6 +378,31 @@ func DrawSubnetGrid(
 	bcast := broadcastAddr(ipnet)
 	first := incIP(network)
 	last := u32ToIP(ipToU32(bcast) - 1)
+
+	// Precompute pool ranges
+	type urange struct{ a, b uint32 }
+	var pools []urange
+	for _, p := range cfg.Pools {
+		start := net.ParseIP(strings.TrimSpace(p.Start)).To4()
+		end := net.ParseIP(strings.TrimSpace(p.End)).To4()
+		if start == nil || end == nil {
+			continue
+		}
+		as := ipToU32(start)
+		be := ipToU32(end)
+		if be < as {
+			as, be = be, as
+		}
+		pools = append(pools, urange{a: as, b: be})
+	}
+	inPools := func(u uint32) bool {
+		for _, r := range pools {
+			if u >= r.a && u <= r.b {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Active leases and banned-mac markings
 	active := make(map[string]LeaseLite)
@@ -389,7 +444,7 @@ func DrawSubnetGrid(
 	}
 
 	// Counters for legend
-	var countLeased, countReserved, countBannedMAC, countBannedIP, countFree int
+	var countLeased, countReserved, countBannedMAC, countBannedIP, countFree, countUnused int
 
 	fmt.Println()
 	fmt.Printf("Subnet usage grid (%s):\n\n", cfg.SubnetCIDR)
@@ -422,8 +477,9 @@ func DrawSubnetGrid(
 		isSpecial := (serverIP != nil && ip.Equal(serverIP)) ||
 			(gatewayIP != nil && ip.Equal(gatewayIP)) ||
 			ip.Equal(network) || ip.Equal(bcast)
+		inPool := inPools(curU)
 
-		// Priority: banned MAC leases → banned/excluded IPs → leased → reserved → free
+		// Priority: banned MAC leases → banned/excluded IPs → leased → reserved → unused → free
 		switch {
 		case isActiveBanned:
 			fmt.Print(blkBannedMAC, " ")
@@ -437,6 +493,9 @@ func DrawSubnetGrid(
 		case isReserved:
 			fmt.Print(blkReserved, " ")
 			countReserved++
+		case !inPool:
+			fmt.Print(blkUnused, " ")
+			countUnused++
 		default:
 			fmt.Print(blkFree, " ")
 			countFree++
@@ -462,7 +521,8 @@ func DrawSubnetGrid(
 		blkReserved, " = reserved/fixed (", countReserved, ")  ",
 		blkBannedMAC, " = banned MAC leases (", countBannedMAC, ")  ",
 		blkBannedIP, " = banned/excluded IPs (", countBannedIP, ")  ",
-		blkFree, " = free (", countFree, ")",
+		blkFree, " = free in pools (", countFree, ")  ",
+		blkUnused, " = unused (not in pools) (", countUnused, ")",
 	)
 	fmt.Println()
 	return nil
@@ -481,7 +541,7 @@ func ipToU32(ip net.IP) uint32 {
 func u32ToIP(v uint32) net.IP {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], v)
-	return net.IP(b[:]) // 4-byte slice (safer for To4/indexing)
+	return net.IP(b[:]) // 4-byte slice (safe for To4/indexing)
 }
 
 func incIP(ip net.IP) net.IP { return u32ToIP(ipToU32(ip) + 1) }
