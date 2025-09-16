@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1165,12 +1166,15 @@ func toIPs(list []string) []net.IP {
 }
 
 func ipToU32(ip net.IP) uint32 { return binary.BigEndian.Uint32(ip.To4()) }
+
 func u32ToIP(v uint32) net.IP {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, v)
 	return net.IP(b)
 }
-func incIP(ip net.IP) net.IP                  { return u32ToIP(ipToU32(ip) + 1) }
+
+func incIP(ip net.IP) net.IP { return u32ToIP(ipToU32(ip) + 1) }
+
 func ipInSubnet(ip net.IP, n *net.IPNet) bool { return n.Contains(ip) }
 
 // parseHexPayload: accepts "01 02", "0x01,0x02", "hex:01:02", etc.
@@ -1256,31 +1260,17 @@ func colourizeConsoleLine(line string, nocolour bool) string {
 }
 
 func (s *Server) logf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-
-	if s.logger != nil {
-		s.logger.Printf("%s", msg)
-	}
-
-	if s.consoleUI != nil {
-		ts := time.Now().Format("2006/01/02 15:04:05.000000")
-		line := colourizeConsoleLine(ts+" "+msg, s.nocolour)
-		s.consoleUI.Append(line)
+	if s.logSink != nil {
+		s.logSink(format, args...)
 	}
 }
 
 // errorf logs to file and (if console enabled) prints red-tagged highlights to stderr too.
 func (s *Server) errorf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-
-	if s.logger != nil {
-		s.logger.Printf("ERROR: %s", msg)
-	}
-
-	if s.consoleUI != nil {
-		ts := time.Now().Format("2006/01/02 15:04:05.000000")
-		line := aurora.Red("ERROR").String() + ": " + msg
-		s.consoleUI.Append(ts + " " + line)
+	if s.errorSink != nil {
+		s.errorSink(format, args...)
+	} else if s.logSink != nil {
+		s.logSink("ERROR: "+format, args...)
 	}
 }
 
@@ -1300,310 +1290,89 @@ func macDisplay(b []byte) string {
 
 /* ----------------- Server ----------------- */
 
-// Server represents a DHCP server instance.
+// Server represents a DHCP server instance, decoupled from Config/Console.
+// It never stores Config/Console values. When it needs them, it calls cfgGet().
 type Server struct {
 	mu sync.RWMutex
 
-	cfg          Config
-	iface        string
-	serverIP     net.IP
-	subnet       *net.IPNet
-	gatewayIP    net.IP
-	dnsIPs       []net.IP
-	leaseDur     time.Duration
-	stickyDur    time.Duration
-	exclusions   map[string]struct{}
-	reservations map[string]string
-	deviceOv     map[string]DeviceOverride
+	// DHCP-runtime state (belongs to DHCP domain)
+	db *LeaseDB
 
-	ntpIPs   []net.IP
-	mtu      int
-	tftpName string
-	bootfile string
-	wpadURL  string
-	winsIPs  []net.IP
-
-	domainSearch []string
-	staticRoutes []StaticRoute
-	mirror249    bool
-	vend43       []byte
-
-	db            *LeaseDB
-	authoritative bool
-
-	// logging
-	logger  *log.Logger
-	logFile *os.File
-	console bool
-
-	// banned MACs (from config) as meta + set
-	bannedMeta map[string]DeviceMeta
-	bannedSet  map[string]struct{}
-
-	// disable console colours when true (set by --nocolour)
-	nocolour bool
-
-	// used for console UI
-	consoleUI *ConsoleUI
+	// Providers/sinks (no structs from other domains stored here)
+	cfgGet    func() *Config       // returns the current Config (atomic/RW-safe outside)
+	authorGet func() bool          // returns current authoritative flag
+	logSink   func(string, ...any) // info/debug sink
+	errorSink func(string, ...any) // error sink
+	now       func() time.Time     // time source (for tests; defaults to time.Now)
 }
 
-func buildServerFromConfig(cfg Config, leasePath string, authoritative bool, old *Server) *Server {
-	_, subnet := mustCIDR(cfg.SubnetCIDR)
-	serverIP := parseIP4(cfg.ServerIP)
-	gatewayIP := parseIP4(cfg.Gateway)
-
-	// Default enumerations if missing
-	if len(cfg.EquipmentTypes) == 0 {
-		cfg.EquipmentTypes = []string{"Switch", "Router", "AP", "Modem", "Gateway"}
-	}
-	if len(cfg.ManagementTypes) == 0 {
-		cfg.ManagementTypes = []string{"ssh", "web", "telnet", "serial", "console"}
-	}
-
-	dnsIPs := toIPs(cfg.DNS)
-	ntpIPs := toIPs(cfg.NTP)
-	winsIPs := toIPs(cfg.WINS)
-
-	mtu := 0
-	if cfg.MTU > 0 {
-		mtu = cfg.MTU
-	}
-	tftpName := strings.TrimSpace(cfg.TFTPServerName)
-	bootfile := strings.TrimSpace(cfg.BootFileName)
-	wpad := strings.TrimSpace(cfg.WPADURL)
-
-	exc := map[string]struct{}{}
-	for _, e := range cfg.Exclusions {
-		ip := parseIP4(e)
-		exc[ip.String()] = struct{}{}
-	}
-
-	// Normalize reservations and validate enums
-	res := map[string]string{}
-	for m, rv := range cfg.Reservations {
-		nm, err := normalizeMACFlexible(m) // <— flexible, lower-case, colonized
-		if err != nil {
-			log.Fatalf("bad reservation MAC %q: %v", m, err)
-		}
-		rip := parseIP4(rv.IP)
-		res[nm] = rip.String()
-
-		// validate equipment_type and management_type if present
-		if rv.EquipmentType != "" && !stringInSlice(rv.EquipmentType, cfg.EquipmentTypes) {
-			log.Printf("warning: reservation %s has unknown equipment_type %q; allowed: %v", nm, rv.EquipmentType, cfg.EquipmentTypes)
-		}
-		if rv.ManagementType != "" && !stringInSlice(rv.ManagementType, cfg.ManagementTypes) {
-			log.Printf("warning: reservation %s has unknown management_type %q; allowed: %v", nm, rv.ManagementType, cfg.ManagementTypes)
-		}
-	}
-
-	// Per-device overrides
-	devOv := map[string]DeviceOverride{}
-	for m, ov := range cfg.DeviceOverrides {
-		nm, err := normalizeMACFlexible(m) // <— flexible
-		if err != nil {
-			log.Fatalf("bad device_overrides MAC %q: %v", m, err)
-		}
-		devOv[nm] = ov
-	}
-
-	// Vendor specific 43
-	var vend43 []byte
-	if cfg.VendorSpecific43Hex != "" {
-		v43, err := parseHexPayload(cfg.VendorSpecific43Hex)
-		if err != nil {
-			log.Fatalf("vendor_specific_43_hex: %v", err)
-		}
-		vend43 = v43
-	}
-
-	// Leasedb
-	var db *LeaseDB
-	if old != nil && old.db != nil {
-		db = old.db
-	} else {
-		db = NewLeaseDB(leasePath)
-		if err := db.Load(); err != nil {
-			log.Printf("lease db load: %v (continuing with empty)", err)
-		}
-	}
-
-	// Normalize Banned MACs to a set and keep meta
-	bannedMeta := make(map[string]DeviceMeta)
-	bannedSet := make(map[string]struct{})
-	for m, meta := range cfg.BannedMACs {
-		nm, err := normalizeMACFlexible(m) // <— flexible
-		if err != nil {
-			log.Fatalf("bad banned_macs MAC %q: %v", m, err)
-		}
-		// enum validation
-		if meta.EquipmentType != "" && !stringInSlice(meta.EquipmentType, cfg.EquipmentTypes) {
-			log.Printf("warning: banned %s has unknown equipment_type %q; allowed: %v", nm, meta.EquipmentType, cfg.EquipmentTypes)
-		}
-		if meta.ManagementType != "" && !stringInSlice(meta.ManagementType, cfg.ManagementTypes) {
-			log.Printf("warning: banned %s has unknown management_type %q; allowed: %v", nm, meta.ManagementType, cfg.ManagementTypes)
-		}
-		bannedMeta[nm] = meta
-		bannedSet[nm] = struct{}{}
-	}
-
-	s := &Server{
-		cfg:           cfg,
-		iface:         cfg.Interface,
-		serverIP:      serverIP,
-		subnet:        subnet,
-		gatewayIP:     gatewayIP,
-		dnsIPs:        dnsIPs,
-		leaseDur:      time.Duration(cfg.LeaseSeconds) * time.Second,
-		stickyDur:     time.Duration(cfg.LeaseStickySeconds) * time.Second,
-		exclusions:    exc,
-		reservations:  res,
-		deviceOv:      devOv,
-		ntpIPs:        ntpIPs,
-		mtu:           mtu,
-		tftpName:      tftpName,
-		bootfile:      bootfile,
-		wpadURL:       wpad,
-		winsIPs:       winsIPs,
-		domainSearch:  cfg.DomainSearch,
-		staticRoutes:  cfg.StaticRoutes,
-		mirror249:     cfg.MirrorRoutesTo249,
-		vend43:        vend43,
-		db:            db,
-		authoritative: authoritative,
-
-		// NEW:
-		bannedMeta: bannedMeta,
-		bannedSet:  bannedSet,
-	}
-	// inherit logger/console if old provided
-	if old != nil {
-		s.logger = old.logger
-		s.logFile = old.logFile
-		s.console = old.console
-	}
-
-	// Ensure reservations are authoritative over leases
-	s.enforceReservationLeaseConsistency()
-
-	return s
-}
-
-// reservations win over leases
-func (s *Server) enforceReservationLeaseConsistency() {
-	// 1) Do all mutations under the DB lock, but DO NOT Save() while locked.
-	s.db.mu.Lock()
+// enforceReservationLeaseConsistency ensures reservations win over leases.
+// Pure function over cfg+db; not tied to Server internals.
+func enforceReservationLeaseConsistency(db *LeaseDB, cfg *Config) {
+	db.mu.Lock()
 	changed := false
-	for mac, r := range s.cfg.Reservations {
+	for mac, r := range cfg.Reservations {
 		norm := strings.ToLower(mac)
-		// Reserved IP must not be leased to someone else
-		if l, ok := s.db.ByIP[r.IP]; ok && !macEqual(l.MAC, norm) {
-			delete(s.db.ByMAC, strings.ToLower(l.MAC))
-			delete(s.db.ByIP, r.IP)
+		if l, ok := db.ByIP[r.IP]; ok && !macEqual(l.MAC, norm) {
+			delete(db.ByMAC, strings.ToLower(l.MAC))
+			delete(db.ByIP, r.IP)
 			changed = true
 		}
-		// Reserved MAC must not have a lease on a different IP
-		if l, ok := s.db.ByMAC[norm]; ok && l.IP != r.IP {
-			delete(s.db.ByIP, l.IP)
-			delete(s.db.ByMAC, norm)
-			changed = true
-		}
-	}
-	if changed {
-		s.db.dirty = true
-	}
-	s.db.mu.Unlock()
-
-	// 2) Save outside the lock to avoid deadlock.
-	if changed {
-		_ = s.db.Save()
-	}
-}
-
-func buildServer(cfgPath string, leasePath string, authoritative bool) *Server {
-	cfg, jerr := parseConfigStrict(cfgPath)
-	if jerr != nil {
-		log.Fatalf("config error: %v", jerr)
-	}
-
-	if len(cfg.EquipmentTypes) == 0 {
-		cfg.EquipmentTypes = []string{"Switch", "Router", "AP", "Modem", "Gateway"}
-	}
-	if len(cfg.ManagementTypes) == 0 {
-		cfg.ManagementTypes = []string{"ssh", "web", "telnet", "serial", "console"}
-	}
-
-	now := time.Now().Unix()
-	changed := false
-	for k, v := range cfg.Reservations {
-		if v.FirstSeen == 0 {
-			v.FirstSeen = now
-			cfg.Reservations[k] = v
-			changed = true
-		}
-	}
-	if cfg.BannedMACs == nil {
-		cfg.BannedMACs = make(map[string]DeviceMeta)
-	}
-	for k, v := range cfg.BannedMACs {
-		if v.FirstSeen == 0 {
-			v.FirstSeen = now
-			cfg.BannedMACs[k] = v
+		if l, ok := db.ByMAC[norm]; ok && l.IP != r.IP {
+			delete(db.ByIP, l.IP)
+			delete(db.ByMAC, norm)
 			changed = true
 		}
 	}
 	if changed {
-		tmp := cfgPath + ".tmp"
-		if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err == nil {
-			if f, err := os.Create(tmp); err == nil {
-				enc := json.NewEncoder(f)
-				enc.SetIndent("", "  ")
-				if err := enc.Encode(&cfg); err == nil {
-					_ = f.Sync()
-					_ = f.Close()
-					_ = os.Rename(tmp, cfgPath)
-				} else {
-					_ = f.Close()
-					_ = os.Remove(tmp)
-					log.Printf("warning: failed to persist first_seen: %v", err)
-				}
-			}
-		}
+		db.dirty = true
 	}
-
-	return buildServerFromConfig(cfg, leasePath, authoritative, nil)
+	db.mu.Unlock()
+	if changed {
+		_ = db.Save()
+	}
 }
 
 /* --------------- DHCP handler --------------- */
 
 // Handler handles incoming DHCP requests.
+// All configuration used here is pulled via s.cfgGet() at the start of the call.
 func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	cfg := s.cfgGet()
+	if cfg == nil {
+		s.errorf("no config available")
+		return
+	}
+	authoritative := s.authorGet()
+
+	_, subnet := mustCIDR(cfg.SubnetCIDR)
+	serverIP := parseIP4(cfg.ServerIP)
 
 	mt := req.MessageType()
 	dispMAC := macDisplay(req.ClientHWAddr)
 
-	// Canonicalize to lower-case "aa:bb:.." and use that everywhere internally.
 	var mac string
 	if nm, err := normalizeMACFlexible(dispMAC); err == nil {
 		mac = nm
 	} else {
-		// very unlikely; keep a lower-cased best-effort so we don't crash
 		mac = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(dispMAC), "-", ":"), " ", ""))
 	}
 
 	hostname := strings.TrimRight(string(req.Options.Get(dhcpv4.OptionHostName)), "\x00")
 
-	// BANNED MAC check (config/env-driven)
-	banned := parseBannedMACsEnv() // or s.bannedSet if you prefer config-only
+	// build banned set from env + cfg
+	banned := parseBannedMACsEnv()
+	for m := range cfg.BannedMACs {
+		if nm, err := normalizeMACFlexible(m); err == nil {
+			banned[nm] = struct{}{}
+		}
+	}
 	if _, isBanned := banned[mac]; isBanned {
 		s.logf("BANNED-MAC %s (%q) sent %s xid=%s — denying", dispMAC, hostname, mt.String(), xidString(req))
-		warnf("BANNED-MAC %s (%q) sent %s xid=%s — denying", dispMAC, hostname, mt.String(), xidString(req))
-		if mt == dhcpv4.MessageTypeRequest && s.authoritative {
+		if mt == dhcpv4.MessageTypeRequest && authoritative {
 			nak, _ := dhcpv4.NewReplyFromRequest(req)
 			nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-			nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+			nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 			_, _ = conn.WriteTo(nak.ToBytes(), peer)
 		}
 		return
@@ -1612,18 +1381,18 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 	switch mt {
 	case dhcpv4.MessageTypeDiscover:
 		s.logf("DISCOVER from %s hostname=%q xid=%s", dispMAC, hostname, xidString(req))
-		ip, ok := s.chooseIPForMAC(mac)
+		ip, ok := s.chooseIPForMAC(cfg, mac)
 		if !ok {
 			s.errorf("POOL EXHAUSTED for %s: no address available in configured pools", dispMAC)
-			if s.authoritative {
+			if authoritative {
 				nak, _ := dhcpv4.NewReplyFromRequest(req)
 				nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-				nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+				nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 				_, _ = conn.WriteTo(nak.ToBytes(), peer)
 			}
 			return
 		}
-		offer, err := s.buildReply(req, dhcpv4.MessageTypeOffer, ip, mac)
+		offer, err := s.buildReply(cfg, req, dhcpv4.MessageTypeOffer, ip, mac)
 		if err != nil {
 			s.logf("offer build error for %s: %v", dispMAC, err)
 			return
@@ -1641,47 +1410,47 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		s.logf("REQUEST from %s requested_ip=%v ciaddr=%v xid=%s", dispMAC, reqIP, req.ClientIPAddr, xidString(req))
 
 		if reqIP == nil {
-			ip, ok := s.chooseIPForMAC(mac)
+			ip, ok := s.chooseIPForMAC(cfg, mac)
 			if !ok {
 				s.errorf("POOL EXHAUSTED for %s: no address available in configured pools", dispMAC)
-				if s.authoritative {
+				if authoritative {
 					nak, _ := dhcpv4.NewReplyFromRequest(req)
 					nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-					nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+					nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 					_, _ = conn.WriteTo(nak.ToBytes(), peer)
 				}
 				return
 			}
 			reqIP = ip
 		}
-		if !ipInSubnet(reqIP, s.subnet) || s.isExcluded(reqIP) || s.db.isDeclined(reqIP.String()) {
+		if !ipInSubnet(reqIP, subnet) || s.isExcluded(cfg, reqIP) || s.db.isDeclined(reqIP.String()) {
 			s.logf("REQUEST invalid ip=%s for %s (excluded/declined/out-of-subnet)", reqIP, dispMAC)
-			if s.authoritative {
+			if authoritative {
 				nak, _ := dhcpv4.NewReplyFromRequest(req)
 				nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-				nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+				nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 				_, _ = conn.WriteTo(nak.ToBytes(), peer)
 			}
 			return
 		}
-		if rmac := s.macForReservedIP(reqIP); rmac != "" && !macEqual(rmac, mac) { // <-- use macEqual here
+		if rmac := s.macForReservedIP(cfg, reqIP); rmac != "" && !macEqual(rmac, mac) {
 			s.logf("REQUEST %s asked for reserved ip=%s owned by %s -> NAK", dispMAC, reqIP, rmac)
-			if s.authoritative {
+			if authoritative {
 				nak, _ := dhcpv4.NewReplyFromRequest(req)
 				nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-				nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+				nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 				_, _ = conn.WriteTo(nak.ToBytes(), peer)
 			}
 			return
 		}
 		if l, ok := s.db.findByIP(reqIP.String()); ok {
-			now := time.Now().Unix()
+			now := s.now().Unix()
 			if now <= l.Expiry && !macEqual(l.MAC, mac) {
 				s.logf("REQUEST ip=%s already leased to %s until %s -> NAK", reqIP, l.MAC, formatEpoch(l.Expiry))
-				if s.authoritative {
+				if authoritative {
 					nak, _ := dhcpv4.NewReplyFromRequest(req)
 					nak.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
-					nak.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
+					nak.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 					_, _ = conn.WriteTo(nak.ToBytes(), peer)
 				}
 				return
@@ -1693,15 +1462,12 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		if prev, ok := s.db.findByMAC(mac); ok && prev.FirstSeen > 0 {
 			firstSeen = prev.FirstSeen
 		} else {
-			firstSeen = time.Now().Unix()
-			// Log to file and console only; DO NOT write to stdout
-			msg := fmt.Sprintf("first_seen: %s here on %s", mac, formatEpoch(firstSeen))
-			s.logf("%s", msg)
-			// (removed) fmt.Fprintf(os.Stdout, "%s\n", msg)
+			firstSeen = s.now().Unix()
+			s.logf("first_seen: %s here on %s", mac, formatEpoch(firstSeen))
 		}
 
-		now := time.Now().Unix()
-		ack, err := s.buildReply(req, dhcpv4.MessageTypeAck, reqIP, mac)
+		now := s.now().Unix()
+		ack, err := s.buildReply(cfg, req, dhcpv4.MessageTypeAck, reqIP, mac)
 		if err != nil {
 			s.logf("ack build error for %s ip=%s: %v", dispMAC, reqIP, err)
 			return
@@ -1711,12 +1477,15 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			IP:          reqIP.String(),
 			Hostname:    hostname,
 			AllocatedAt: now,
-			Expiry:      now + int64(s.leaseDur.Seconds()),
+			Expiry:      now + int64(cfg.LeaseSeconds),
 			FirstSeen:   firstSeen,
 		}
 		s.db.set(lease)
 		_ = s.db.Save()
-		s.logf("ACK %s <- %s lease=%s (alloc=%s, exp=%s)", dispMAC, reqIP.String(), s.leaseDur, formatEpoch(lease.AllocatedAt), formatEpoch(lease.Expiry))
+		s.logf("ACK %s <- %s lease=%s (alloc=%s, exp=%s)",
+			dispMAC, reqIP.String(),
+			time.Duration(cfg.LeaseSeconds)*time.Second,
+			formatEpoch(lease.AllocatedAt), formatEpoch(lease.Expiry))
 		_, _ = conn.WriteTo(ack.ToBytes(), peer)
 
 	case dhcpv4.MessageTypeRelease:
@@ -1738,21 +1507,28 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 	}
 }
 
-func (s *Server) isExcluded(ip net.IP) bool {
-	_, ok := s.exclusions[ip.String()]
-	return ok
+func (s *Server) isExcluded(cfg *Config, ip net.IP) bool {
+	for _, e := range cfg.Exclusions {
+		if ip.Equal(parseIP4(e)) {
+			return true
+		}
+	}
+	return false
 }
 
-func (s *Server) macForReservedIP(ip net.IP) string {
-	for m, r := range s.cfg.Reservations {
+func (s *Server) macForReservedIP(cfg *Config, ip net.IP) string {
+	for m, r := range cfg.Reservations {
 		if r.IP == ip.String() {
+			if nm, err := normalizeMACFlexible(m); err == nil {
+				return nm
+			}
 			return m
 		}
 	}
 	return ""
 }
 
-// chooseIPForMAC implements the new policy:
+// chooseIPForMAC implements the policy:
 //
 //  1. If there is a reservation for this MAC -> return it.
 //  2. If this MAC had any previous lease -> try that same IP again (even if long expired),
@@ -1760,16 +1536,37 @@ func (s *Server) macForReservedIP(ip net.IP) string {
 //  3. Scan pools for a **brand-new** IP (never seen in the leases DB).
 //  4. If none available, recycle an **expired** previously-used IP that is safe to reuse.
 //  5. If still none, return false (pool exhausted).
-func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
+func (s *Server) chooseIPForMAC(cfg *Config, mac string) (net.IP, bool) {
+	_, subnet := mustCIDR(cfg.SubnetCIDR)
+	serverIP := parseIP4(cfg.ServerIP)
+	gatewayIP := parseIP4(cfg.Gateway)
+
+	isBad := func(ip net.IP) bool {
+		if !ipInSubnet(ip, subnet) || s.isExcluded(cfg, ip) || s.db.isDeclined(ip.String()) {
+			return true
+		}
+		if ip.Equal(serverIP) || ip.Equal(gatewayIP) {
+			return true
+		}
+		network := subnet.IP.Mask(subnet.Mask)
+		bcast := broadcastAddr(subnet)
+		if ip.Equal(network) || ip.Equal(bcast) {
+			return true
+		}
+		if rmac := s.macForReservedIP(cfg, ip); rmac != "" && !macEqual(rmac, mac) {
+			return true
+		}
+		return false
+	}
+
 	// 1) Reservation first
-	if rip, ok := s.reservations[mac]; ok {
-		ip := net.ParseIP(rip).To4()
-		if ip == nil || !ipInSubnet(ip, s.subnet) || s.isExcluded(ip) || s.db.isDeclined(ip.String()) {
+	if rv, ok := cfg.Reservations[mac]; ok {
+		ip := parseIP4(rv.IP)
+		if ip == nil || isBad(ip) {
 			return nil, false
 		}
-		// If someone else actively holds it, we cannot give it yet.
 		if l, ok := s.db.findByIP(ip.String()); ok {
-			now := time.Now().Unix()
+			now := s.now().Unix()
 			if now <= l.Expiry && !macEqual(l.MAC, mac) {
 				return nil, false
 			}
@@ -1777,48 +1574,21 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 		return ip, true
 	}
 
-	now := time.Now().Unix()
+	now := s.now().Unix()
 
 	// 2) Prefer same IP we gave this MAC before (if safe).
 	if l, ok := s.db.findByMAC(mac); ok {
 		ip := net.ParseIP(l.IP).To4()
-		if ip != nil &&
-			ipInSubnet(ip, s.subnet) &&
-			!s.isExcluded(ip) &&
-			!s.db.isDeclined(ip.String()) {
-
-			// Proceed only if the IP is NOT reserved for a different MAC.
-			rmac := s.macForReservedIP(ip)
-			if rmac == "" || macEqual(rmac, mac) {
-				if cur, ok := s.db.findByIP(ip.String()); !ok ||
-					macEqual(cur.MAC, mac) || now > cur.Expiry {
-					return ip, true
-				}
+		if ip != nil && !isBad(ip) {
+			if cur, ok := s.db.findByIP(ip.String()); !ok ||
+				macEqual(cur.MAC, mac) || now > cur.Expiry {
+				return ip, true
 			}
 		}
 	}
 
-	// helper to filter unusable IPs
-	isBad := func(ip net.IP) bool {
-		if !ipInSubnet(ip, s.subnet) || s.isExcluded(ip) || s.db.isDeclined(ip.String()) {
-			return true
-		}
-		if ip.Equal(s.serverIP) || ip.Equal(s.gatewayIP) {
-			return true
-		}
-		network := s.subnet.IP.Mask(s.subnet.Mask)
-		bcast := broadcastAddr(s.subnet)
-		if ip.Equal(network) || ip.Equal(bcast) {
-			return true
-		}
-		if rmac := s.macForReservedIP(ip); rmac != "" && !macEqual(rmac, mac) {
-			return true
-		}
-		return false
-	}
-
 	// 3) Brand-new IPs (never in DB)
-	for _, p := range s.cfg.Pools {
+	for _, p := range cfg.Pools {
 		start := parseIP4(p.Start)
 		end := parseIP4(p.End)
 		for ip := start; ipToU32(ip) <= ipToU32(end); ip = incIP(ip) {
@@ -1832,7 +1602,7 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 	}
 
 	// 4) Recycle expired, safe IPs
-	for _, p := range s.cfg.Pools {
+	for _, p := range cfg.Pools {
 		start := parseIP4(p.Start)
 		end := parseIP4(p.End)
 		for ip := start; ipToU32(ip) <= ipToU32(end); ip = incIP(ip) {
@@ -1840,11 +1610,10 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 				continue
 			}
 			if l, ok := s.db.findByIP(ip.String()); ok {
-				rmac := s.macForReservedIP(ip)
+				rmac := s.macForReservedIP(cfg, ip)
 				if now > l.Expiry && (macEqual(l.MAC, mac) || rmac == "" || macEqual(rmac, mac)) {
 					return ip, true
 				}
-				continue
 			}
 		}
 	}
@@ -1852,64 +1621,65 @@ func (s *Server) chooseIPForMAC(mac string) (net.IP, bool) {
 	return nil, false
 }
 
-func (s *Server) buildReply(req *dhcpv4.DHCPv4, typ dhcpv4.MessageType, yiaddr net.IP, mac string) (*dhcpv4.DHCPv4, error) {
+func (s *Server) buildReply(cfg *Config, req *dhcpv4.DHCPv4, typ dhcpv4.MessageType, yiaddr net.IP, mac string) (*dhcpv4.DHCPv4, error) {
 	resp, err := dhcpv4.NewReplyFromRequest(req)
 	if err != nil {
 		return nil, err
 	}
+	_, subnet := mustCIDR(cfg.SubnetCIDR)
+	serverIP := parseIP4(cfg.ServerIP)
+	gatewayIP := parseIP4(cfg.Gateway)
+
 	resp.UpdateOption(dhcpv4.OptMessageType(typ))
 	resp.YourIPAddr = yiaddr.To4()
 
+	leaseDur := time.Duration(cfg.LeaseSeconds) * time.Second
+
 	// Core identifiers and timers
-	resp.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
-	resp.UpdateOption(dhcpv4.OptSubnetMask(net.IPMask(s.subnet.Mask)))
-	resp.UpdateOption(dhcpv4.OptRouter(s.gatewayIP))
-	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.leaseDur))
-	resp.UpdateOption(dhcpv4.OptRenewTimeValue(s.leaseDur / 2))
-	resp.UpdateOption(dhcpv4.OptRebindingTimeValue(s.leaseDur * 7 / 8))
+	resp.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
+	resp.UpdateOption(dhcpv4.OptSubnetMask(net.IPMask(subnet.Mask)))
+	resp.UpdateOption(dhcpv4.OptRouter(gatewayIP))
+	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(leaseDur))
+	resp.UpdateOption(dhcpv4.OptRenewTimeValue(leaseDur / 2))
+	resp.UpdateOption(dhcpv4.OptRebindingTimeValue(leaseDur * 7 / 8))
 
-	// Global DNS (can be overridden per-device)
-	if len(s.dnsIPs) > 0 {
-		resp.UpdateOption(dhcpv4.OptDNS(s.dnsIPs...))
+	// DNS + Domain
+	if len(cfg.DNS) > 0 {
+		resp.UpdateOption(dhcpv4.OptDNS(toIPs(cfg.DNS)...))
 	}
-	if s.cfg.Domain != "" {
-		resp.UpdateOption(dhcpv4.OptDomainName(s.cfg.Domain))
+	if cfg.Domain != "" {
+		resp.UpdateOption(dhcpv4.OptDomainName(cfg.Domain))
 	}
 
-	// Global extras
-	if len(s.ntpIPs) > 0 {
-		resp.UpdateOption(dhcpv4.OptNTPServers(s.ntpIPs...))
+	// Extras
+	if len(cfg.NTP) > 0 {
+		resp.UpdateOption(dhcpv4.OptNTPServers(toIPs(cfg.NTP)...))
 	}
-	if s.mtu > 0 {
+	if cfg.MTU > 0 {
 		mtu := make([]byte, 2)
-		binary.BigEndian.PutUint16(mtu, uint16(s.mtu))
+		binary.BigEndian.PutUint16(mtu, uint16(cfg.MTU))
 		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(26), mtu)) // Interface MTU
 	}
-	// Global TFTP/Bootfile (overridable by device)
-	if s.tftpName != "" {
-		resp.UpdateOption(dhcpv4.OptTFTPServerName(s.tftpName)) // 66
+	if cfg.TFTPServerName != "" {
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(cfg.TFTPServerName))
 	}
-	if s.bootfile != "" {
-		resp.BootFileName = s.bootfile
-		resp.UpdateOption(dhcpv4.OptBootFileName(s.bootfile)) // 67
+	if cfg.BootFileName != "" {
+		resp.BootFileName = cfg.BootFileName
+		resp.UpdateOption(dhcpv4.OptBootFileName(cfg.BootFileName))
 	}
-	// WPAD (252)
-	if s.wpadURL != "" {
-		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(252), []byte(s.wpadURL)))
+	if cfg.WPADURL != "" {
+		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(252), []byte(cfg.WPADURL)))
 	}
-	// WINS (44)
-	if len(s.winsIPs) > 0 {
-		resp.UpdateOption(dhcpv4.OptNetBIOSNameServers(s.winsIPs...))
+	if len(cfg.WINS) > 0 {
+		resp.UpdateOption(dhcpv4.OptNetBIOSNameServers(toIPs(cfg.WINS)...))
 	}
-	// Domain Search (119)
-	if len(s.domainSearch) > 0 {
-		lbls := &rfc1035label.Labels{Labels: append([]string(nil), s.domainSearch...)}
+	if len(cfg.DomainSearch) > 0 {
+		lbls := &rfc1035label.Labels{Labels: append([]string(nil), cfg.DomainSearch...)}
 		resp.UpdateOption(dhcpv4.OptDomainSearch(lbls))
 	}
-	// Classless Routes (121) + optional mirror 249
-	if len(s.staticRoutes) > 0 {
+	if len(cfg.StaticRoutes) > 0 {
 		var rs []*dhcpv4.Route
-		for _, r := range s.staticRoutes {
+		for _, r := range cfg.StaticRoutes {
 			_, ipnet, err := net.ParseCIDR(strings.TrimSpace(r.CIDR))
 			if err != nil {
 				return nil, fmt.Errorf("bad CIDR %q: %w", r.CIDR, err)
@@ -1918,18 +1688,19 @@ func (s *Server) buildReply(req *dhcpv4.DHCPv4, typ dhcpv4.MessageType, yiaddr n
 			rs = append(rs, &dhcpv4.Route{Dest: ipnet, Router: gw})
 		}
 		resp.UpdateOption(dhcpv4.OptClasslessStaticRoute(rs...)) // 121
-		if s.mirror249 {
+		if cfg.MirrorRoutesTo249 {
 			b := dhcpv4.Routes(rs).ToBytes()
 			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(249), b))
 		}
 	}
-	// Vendor Specific (43) raw payload
-	if len(s.vend43) > 0 {
-		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, s.vend43))
+	if cfg.VendorSpecific43Hex != "" {
+		if v43, err := parseHexPayload(cfg.VendorSpecific43Hex); err == nil && len(v43) > 0 {
+			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, v43))
+		}
 	}
 
 	// Per-device overrides: ONLY DNS/TFTP/Bootfile
-	if ov, has := s.deviceOv[mac]; has {
+	if ov, has := cfg.DeviceOverrides[mac]; has {
 		if len(ov.DNS) > 0 {
 			resp.UpdateOption(dhcpv4.OptDNS(toIPs(ov.DNS)...))
 		}
@@ -1943,38 +1714,6 @@ func (s *Server) buildReply(req *dhcpv4.DHCPv4, typ dhcpv4.MessageType, yiaddr n
 	}
 
 	return resp, nil
-}
-
-/* ----------------- Reload & runtime ----------------- */
-
-func (s *Server) applyNewConfig(cfg Config, leasePath string) {
-	// Build a temp server from cfg, then copy fields under lock.
-	newS := buildServerFromConfig(cfg, leasePath, s.authoritative, s)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.cfg = newS.cfg
-	s.iface = newS.iface
-	s.serverIP = newS.serverIP
-	s.subnet = newS.subnet
-	s.gatewayIP = newS.gatewayIP
-	s.dnsIPs = newS.dnsIPs
-	s.leaseDur = newS.leaseDur
-	s.stickyDur = newS.stickyDur
-	s.exclusions = newS.exclusions
-	s.reservations = newS.reservations
-	s.deviceOv = newS.deviceOv
-	s.ntpIPs = newS.ntpIPs
-	s.mtu = newS.mtu
-	s.tftpName = newS.tftpName
-	s.bootfile = newS.bootfile
-	s.wpadURL = newS.wpadURL
-	s.winsIPs = newS.winsIPs
-	s.domainSearch = newS.domainSearch
-	s.staticRoutes = newS.staticRoutes
-	s.mirror249 = newS.mirror249
-	s.vend43 = newS.vend43
-	// db/logger/console unchanged
 }
 
 func writePID(pidPath string) error {
@@ -2000,7 +1739,292 @@ func readPID(pidPath string) (int, error) {
 	return pid, nil
 }
 
-func (s *Server) startWatcher(cfgPath, leasePath string) (*fsnotify.Watcher, error) {
+// newServer wires a decoupled Server.
+func newServer(
+	db *LeaseDB,
+	cfgGet func() *Config,
+	authorGet func() bool,
+	logSink func(string, ...any),
+	errorSink func(string, ...any),
+) *Server {
+	if cfgGet == nil {
+		cfgGet = func() *Config { return nil }
+	}
+	if authorGet == nil {
+		authorGet = func() bool { return true }
+	}
+	return &Server{
+		db:        db,
+		cfgGet:    cfgGet,
+		authorGet: authorGet,
+		logSink:   logSink,
+		errorSink: errorSink,
+		now:       time.Now,
+	}
+}
+
+func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, logPath string, console bool, pidPath string, nocolour bool) error {
+	// Load + validate/normalize initial config
+	raw, jerr := parseConfigStrict(cfgPath)
+	if jerr != nil {
+		return fmt.Errorf("config error: %w", jerr)
+	}
+	cfg, warns, verr := validateAndNormalizeConfig(raw)
+	if verr != nil {
+		return fmt.Errorf("config validation: %w", verr)
+	}
+
+	// Lease DB
+	db := NewLeaseDB(leasePath)
+	if err := db.Load(); err != nil {
+		log.Printf("lease db load: %v (continuing with empty)", err)
+	}
+
+	// Logger (file)
+	lg, f, err := setupLogger(logPath)
+	if err != nil {
+		return fmt.Errorf("logger: %w", err)
+	}
+	defer func() {
+		if f != nil {
+			_ = f.Sync()
+			_ = f.Close()
+		}
+	}()
+
+	// Optional console UI
+	var ui *ConsoleUI
+	if console {
+		maxLines := cfg.ConsoleMaxLines
+		if maxLines <= 0 {
+			maxLines = 10000
+		}
+		ui = NewConsoleUI(nocolour, maxLines)
+		ui.Start()
+		defer ui.Stop()
+	}
+
+	// Sinks
+	logSink := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		if lg != nil {
+			lg.Printf("%s", msg)
+		}
+		if ui != nil {
+			ts := time.Now().Format("2006/01/02 15:04:05.000000")
+			ui.Append(colourizeConsoleLine(ts+" "+msg, nocolour))
+		}
+	}
+	errorSink := func(format string, args ...any) {
+		msg := fmt.Sprintf("ERROR: "+format, args...)
+		if lg != nil {
+			lg.Printf("%s", msg)
+		}
+		if ui != nil {
+			ts := time.Now().Format("2006/01/02 15:04:05.000000")
+			ui.Append(ts + " " + aurora.Red(msg).String())
+		}
+	}
+
+	// Log any initial warnings
+	for _, w := range warns {
+		logSink("%s", w)
+	}
+
+	// Atomic config snapshot
+	var cfgAtomic atomic.Value
+	cfgAtomic.Store(&cfg)
+	cfgGet := func() *Config { return cfgAtomic.Load().(*Config) }
+
+	// Authoritative getter
+	authorGet := func() bool { return authoritative }
+
+	// One-shot compaction on initial load ONLY if enabled
+	if cfg.CompactOnLoad {
+		sticky := time.Duration(cfg.LeaseStickySeconds) * time.Second
+		if n := db.compactNow(sticky); n > 0 {
+			logSink("LEASE-COMPACT removed=%d (on initial load)", n)
+		}
+	}
+
+	// Enforce reservations immediately
+	enforceReservationLeaseConsistency(db, &cfg)
+
+	// PID
+	if err := writePID(pidPath); err != nil {
+		return fmt.Errorf("write pid: %w", err)
+	}
+
+	// Decoupled server
+	s := newServer(db, cfgGet, authorGet, logSink, errorSink)
+
+	// Bind + Serve, with rebind support when Interface changes
+	laddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 67}
+	var srv *server4.Server
+	var currentIface = cfg.Interface
+	bind := func(newIface string) error {
+		if srv != nil {
+			_ = srv.Close()
+			srv = nil
+		}
+		nsrv, err := server4.NewServer(newIface, laddr, s.Handler)
+		if err != nil {
+			return err
+		}
+		srv = nsrv
+		go func() {
+			if err := srv.Serve(); err != nil {
+				logSink("SERVER ERROR: %v", err)
+			}
+		}()
+		currentIface = newIface
+		return nil
+	}
+	if err := bind(currentIface); err != nil {
+		return fmt.Errorf("bind: %w (need root/CAP_NET_BIND_SERVICE)", err)
+	}
+
+	logSink("START iface=%q bind=%s server_ip=%s subnet=%s gateway=%s lease=%s sticky=%s",
+		currentIface, laddr.String(), cfg.ServerIP, cfg.SubnetCIDR, cfg.Gateway,
+		time.Duration(cfg.LeaseSeconds)*time.Second, time.Duration(cfg.LeaseStickySeconds)*time.Second)
+	if cfg.AutoReload {
+		logSink("START auto_reload=true (watching %s)", cfgPath)
+	}
+
+	// Optional auto-reload watcher
+	var watcher *fsnotify.Watcher
+	var watcherErr error
+	if cfg.AutoReload {
+		watcher, watcherErr = startConfigWatcher(cfgPath, func(newCfg Config, newWarns []string) {
+			// Apply normalized+validated cfg
+			cfgAtomic.Store(&newCfg)
+			for _, w := range newWarns {
+				logSink("%s", w)
+			}
+			enforceReservationLeaseConsistency(db, &newCfg)
+			if newCfg.CompactOnLoad {
+				if n := db.compactNow(time.Duration(newCfg.LeaseStickySeconds) * time.Second); n > 0 {
+					logSink("LEASE-COMPACT removed=%d (on auto-reload)", n)
+				}
+			}
+			// Rebind if interface changed
+			if newCfg.Interface != currentIface {
+				if err := bind(newCfg.Interface); err != nil {
+					logSink("AUTO-RELOAD: rebind failed for iface %q: %v (keeping %q)", newCfg.Interface, err, currentIface)
+				} else {
+					logSink("AUTO-RELOAD: rebound to iface=%q", newCfg.Interface)
+				}
+			}
+			logSink("AUTO-RELOAD: config applied")
+		}, logSink)
+		if watcherErr != nil {
+			logSink("AUTO-RELOAD: watcher failed: %v", watcherErr)
+		}
+	}
+
+	// Signals: INT/TERM stop; HUP reload
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	for {
+		select {
+		case sig := <-sigc:
+			switch sig {
+			case syscall.SIGHUP:
+				rawNew, jerr := parseConfigStrict(cfgPath)
+				if jerr != nil {
+					logSink("RELOAD: config invalid, keeping old settings: %v", jerr)
+					continue
+				}
+
+				// Stamp/persist first_seen (unchanged behavior)
+				nowEpoch := time.Now().Unix()
+				changed := false
+				for k, v := range rawNew.Reservations {
+					if v.FirstSeen == 0 {
+						v.FirstSeen = nowEpoch
+						rawNew.Reservations[k] = v
+						changed = true
+					}
+				}
+				if rawNew.BannedMACs == nil {
+					rawNew.BannedMACs = make(map[string]DeviceMeta)
+				}
+				for k, v := range rawNew.BannedMACs {
+					if v.FirstSeen == 0 {
+						v.FirstSeen = nowEpoch
+						rawNew.BannedMACs[k] = v
+						changed = true
+					}
+				}
+				if changed {
+					tmp := cfgPath + ".tmp"
+					if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err == nil {
+						if f2, err := os.Create(tmp); err == nil {
+							enc := json.NewEncoder(f2)
+							enc.SetIndent("", "  ")
+							if err := enc.Encode(&rawNew); err == nil {
+								_ = f2.Sync()
+								_ = f2.Close()
+								_ = os.Rename(tmp, cfgPath)
+							} else {
+								_ = f2.Close()
+								_ = os.Remove(tmp)
+								logSink("RELOAD: failed to persist first_seen update: %v", err)
+							}
+						}
+					}
+				}
+
+				// Validate + normalize
+				newCfg, newWarns, verr := validateAndNormalizeConfig(rawNew)
+				if verr != nil {
+					logSink("RELOAD: validation failed, keeping old settings: %v", verr)
+					continue
+				}
+				for _, w := range newWarns {
+					logSink("%s", w)
+				}
+
+				// Apply
+				cfgAtomic.Store(&newCfg)
+				enforceReservationLeaseConsistency(db, &newCfg)
+				if newCfg.CompactOnLoad {
+					if n := db.compactNow(time.Duration(newCfg.LeaseStickySeconds) * time.Second); n > 0 {
+						logSink("LEASE-COMPACT removed=%d (on config reload)", n)
+					}
+				}
+				// Rebind if interface changed
+				if newCfg.Interface != currentIface {
+					if err := bind(newCfg.Interface); err != nil {
+						logSink("RELOAD: rebind failed for iface %q: %v (keeping %q)", newCfg.Interface, err, currentIface)
+					} else {
+						logSink("RELOAD: rebound to iface=%q", newCfg.Interface)
+					}
+				}
+				logSink("RELOAD: config applied")
+
+			case syscall.SIGINT, syscall.SIGTERM:
+				logSink("SIGNAL received, shutting down")
+				if srv != nil {
+					_ = srv.Close()
+				}
+				_ = db.Save()
+				if watcher != nil {
+					_ = watcher.Close()
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// startConfigWatcher watches cfgPath and calls onApply(validatedCfg) after successful parses.
+// It also performs the first_seen stamping persist just like your prior watcher.
+func startConfigWatcher(
+	cfgPath string,
+	onApply func(Config, []string), // now also passes warnings
+	logf func(string, ...any),
+) (*fsnotify.Watcher, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -2020,152 +2044,24 @@ func (s *Server) startWatcher(cfgPath, leasePath string) (*fsnotify.Watcher, err
 				if filepath.Clean(ev.Name) != filepath.Clean(cfgPath) {
 					continue
 				}
-				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Chmod) != 0 {
-					time.Sleep(150 * time.Millisecond)
-					cfg, jerr := parseConfigStrict(cfgPath)
-					if jerr != nil {
-						s.logf("AUTO-RELOAD: config invalid, keeping old settings: %v", jerr)
-						continue
-					}
-					now := time.Now().Unix()
-					changed := false
-					for k, v := range cfg.Reservations {
-						if v.FirstSeen == 0 {
-							v.FirstSeen = now
-							cfg.Reservations[k] = v
-							changed = true
-						}
-					}
-					if cfg.BannedMACs == nil {
-						cfg.BannedMACs = make(map[string]DeviceMeta)
-					}
-					for k, v := range cfg.BannedMACs {
-						if v.FirstSeen == 0 {
-							v.FirstSeen = now
-							cfg.BannedMACs[k] = v
-							changed = true
-						}
-					}
-					if changed {
-						tmp := cfgPath + ".tmp"
-						if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err == nil {
-							if f, err := os.Create(tmp); err == nil {
-								enc := json.NewEncoder(f)
-								enc.SetIndent("", "  ")
-								if err := enc.Encode(&cfg); err == nil {
-									_ = f.Sync()
-									_ = f.Close()
-									_ = os.Rename(tmp, cfgPath)
-								} else {
-									_ = f.Close()
-									_ = os.Remove(tmp)
-									s.logf("AUTO-RELOAD: failed to persist first_seen: %v", err)
-								}
-							}
-						}
-					}
-					s.applyNewConfig(cfg, leasePath)
-					s.enforceReservationLeaseConsistency()
-					if s.cfg.CompactOnLoad {
-						if n := s.db.compactNow(s.stickyDur); n > 0 {
-							s.logf("LEASE-COMPACT removed=%d (on auto-reload)", n)
-						}
-					}
-					s.logf("AUTO-RELOAD: config applied")
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Chmod) == 0 {
+					continue
 				}
-			case err := <-w.Errors:
-				s.logf("watcher error: %v", err)
-			}
-		}
-	}()
-	return w, nil
-}
+				time.Sleep(150 * time.Millisecond)
 
-func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath string, console bool, pidPath string, nocolour bool) error {
-	s := buildServer(cfgPath, leasePath, authoritative)
-
-	lg, f, err := setupLogger(logPath)
-	if err != nil {
-		return fmt.Errorf("logger: %w", err)
-	}
-	s.logger = lg
-	s.logFile = f
-	s.console = console
-	s.nocolour = nocolour
-
-	if console {
-		maxLines := s.cfg.ConsoleMaxLines
-		if maxLines <= 0 {
-			maxLines = 10000
-		}
-		s.consoleUI = NewConsoleUI(nocolour, maxLines)
-		s.consoleUI.Start()
-		defer s.consoleUI.Stop()
-	}
-
-	// PID
-	if err := writePID(pidPath); err != nil {
-		return fmt.Errorf("write pid: %w", err)
-	}
-
-	// One-shot compaction on initial load ONLY if enabled
-	if s.cfg.CompactOnLoad {
-		if n := s.db.compactNow(s.stickyDur); n > 0 {
-			s.logf("LEASE-COMPACT removed=%d (on initial load)", n)
-		}
-	}
-
-	// Optional auto-reload watcher
-	var watcher *fsnotify.Watcher
-	if s.cfg.AutoReload {
-		watcher, err = s.startWatcher(cfgPath, leasePath)
-		if err != nil {
-			s.logf("AUTO-RELOAD: watcher failed: %v", err)
-		} else {
-			s.logf("AUTO-RELOAD: watching %s", cfgPath)
-		}
-	}
-
-	// Bind: interface name ("" for all), local UDP addr :67
-	laddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 67}
-	srv, err := server4.NewServer(s.iface, laddr, s.Handler)
-	if err != nil {
-		if watcher != nil {
-			_ = watcher.Close()
-		}
-		return fmt.Errorf("bind: %w (need root/CAP_NET_BIND_SERVICE)", err)
-	}
-
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve() }()
-
-	s.logf("START iface=%q bind=%s server_ip=%s subnet=%s gateway=%s lease=%s sticky=%s",
-		s.iface, laddr.String(), s.serverIP, s.cfg.SubnetCIDR, s.gatewayIP, s.leaseDur, s.stickyDur)
-	if s.cfg.AutoReload {
-		s.logf("START auto_reload=true (watching %s)", cfgPath)
-	}
-
-	// Signals: INT/TERM stop; HUP reload
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	for {
-		select {
-		case sig := <-sigc:
-			switch sig {
-			case syscall.SIGHUP:
+				// Parse
 				cfg, jerr := parseConfigStrict(cfgPath)
 				if jerr != nil {
-					s.logf("RELOAD: config invalid, keeping old settings: %v", jerr)
+					logf("AUTO-RELOAD: config invalid, keeping old settings: %v", jerr)
 					continue
 				}
 
-				// Stamp/persist first_seen (epoch) if missing on reservations and banned_macs
-				nowEpoch := time.Now().Unix()
+				// Stamp/persist first_seen (unchanged behavior)
+				now := time.Now().Unix()
 				changed := false
-
 				for k, v := range cfg.Reservations {
 					if v.FirstSeen == 0 {
-						v.FirstSeen = nowEpoch
+						v.FirstSeen = now
 						cfg.Reservations[k] = v
 						changed = true
 					}
@@ -2175,12 +2071,11 @@ func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath st
 				}
 				for k, v := range cfg.BannedMACs {
 					if v.FirstSeen == 0 {
-						v.FirstSeen = nowEpoch
+						v.FirstSeen = now
 						cfg.BannedMACs[k] = v
 						changed = true
 					}
 				}
-
 				if changed {
 					tmp := cfgPath + ".tmp"
 					if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err == nil {
@@ -2194,51 +2089,28 @@ func buildServerAndRun(cfgPath, leasePath string, authoritative bool, logPath st
 							} else {
 								_ = f.Close()
 								_ = os.Remove(tmp)
-								s.logf("RELOAD: failed to persist first_seen update: %v", err)
+								logf("AUTO-RELOAD: failed to persist first_seen: %v", err)
 							}
 						}
 					}
 				}
 
-				// Apply and enforce
-				s.applyNewConfig(cfg, leasePath)
-				s.enforceReservationLeaseConsistency()
-
-				// Optional compaction only when enabled
-				if s.cfg.CompactOnLoad {
-					if n := s.db.compactNow(s.stickyDur); n > 0 {
-						s.logf("LEASE-COMPACT removed=%d (on config reload)", n)
-					}
+				// Validate + normalize (restores lost behavior)
+				norm, warns, verr := validateAndNormalizeConfig(cfg)
+				if verr != nil {
+					logf("AUTO-RELOAD: validation failed, keeping old settings: %v", verr)
+					continue
 				}
-				s.logf("RELOAD: config applied")
 
-			case syscall.SIGINT, syscall.SIGTERM:
-				s.logf("SIGNAL received, shutting down")
-				_ = srv.Close()
-				_ = s.db.Save()
-				if watcher != nil {
-					_ = watcher.Close()
-				}
-				if s.logFile != nil {
-					_ = s.logFile.Sync()
-					_ = s.logFile.Close()
-				}
-				return nil
-			}
+				// Apply
+				onApply(norm, warns)
 
-		case err := <-errc:
-			s.logf("SERVER ERROR: %v", err)
-			_ = s.db.Save()
-			if watcher != nil {
-				_ = watcher.Close()
+			case err := <-w.Errors:
+				logf("watcher error: %v", err)
 			}
-			if s.logFile != nil {
-				_ = s.logFile.Sync()
-				_ = s.logFile.Close()
-			}
-			return err
 		}
-	}
+	}()
+	return w, nil
 }
 
 /* ----------------- Stats command helpers ----------------- */
@@ -3106,6 +2978,98 @@ func stringInSlice(s string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// validateAndNormalizeConfig applies defaults, normalizes MAC-keyed maps,
+// validates option 43, and returns any warnings to log.
+// It returns a COPY of cfg with fixes applied.
+func validateAndNormalizeConfig(cfg Config) (Config, []string, error) {
+	c := cfg // copy
+	var warns []string
+
+	// 1) Defaults for enum lists (match old behavior)
+	if len(c.EquipmentTypes) == 0 {
+		c.EquipmentTypes = []string{"Switch", "Router", "AP", "Modem", "Gateway"}
+	}
+	if len(c.ManagementTypes) == 0 {
+		c.ManagementTypes = []string{"ssh", "web", "telnet", "serial", "console"}
+	}
+
+	// 2) Normalize Reservations map keys and warn on unknown enums (same texts)
+	if c.Reservations == nil {
+		c.Reservations = make(Reservations)
+	} else {
+		norm := make(Reservations, len(c.Reservations))
+		for m, rv := range c.Reservations {
+			nm, err := normalizeMACFlexible(m)
+			if err != nil {
+				return cfg, warns, fmt.Errorf("bad reservation MAC %q: %w", m, err)
+			}
+			// enum validation warnings (same logic/messages as before)
+			if rv.EquipmentType != "" && !stringInSlice(rv.EquipmentType, c.EquipmentTypes) {
+				warns = append(warns, fmt.Sprintf(
+					"warning: reservation %s has unknown equipment_type %q; allowed: %v",
+					nm, rv.EquipmentType, c.EquipmentTypes))
+			}
+			if rv.ManagementType != "" && !stringInSlice(rv.ManagementType, c.ManagementTypes) {
+				warns = append(warns, fmt.Sprintf(
+					"warning: reservation %s has unknown management_type %q; allowed: %v",
+					nm, rv.ManagementType, c.ManagementTypes))
+			}
+			// normalize stored IP as well (parse to v4 then back to string)
+			ip := parseIP4(rv.IP)
+			rv.IP = ip.String()
+			norm[nm] = rv
+		}
+		c.Reservations = norm
+	}
+
+	// 3) Normalize DeviceOverrides MAC keys
+	if c.DeviceOverrides == nil {
+		c.DeviceOverrides = make(map[string]DeviceOverride)
+	} else {
+		norm := make(map[string]DeviceOverride, len(c.DeviceOverrides))
+		for m, ov := range c.DeviceOverrides {
+			nm, err := normalizeMACFlexible(m)
+			if err != nil {
+				return cfg, warns, fmt.Errorf("bad device_overrides MAC %q: %w", m, err)
+			}
+			// Later keys silently override earlier if they normalize to same MAC.
+			norm[nm] = ov
+		}
+		c.DeviceOverrides = norm
+	}
+
+	// 4) Validate VendorSpecific43Hex once (reject invalid configs)
+	if s := strings.TrimSpace(c.VendorSpecific43Hex); s != "" {
+		if _, err := parseHexPayload(s); err != nil {
+			return cfg, warns, fmt.Errorf("vendor_specific_43_hex: %w", err)
+		}
+	}
+
+	// 5) Warnings for BannedMACs enum meta (same texts as before)
+	if c.BannedMACs == nil {
+		c.BannedMACs = make(map[string]DeviceMeta)
+	} else {
+		for m, meta := range c.BannedMACs {
+			nm, err := normalizeMACFlexible(m)
+			if err != nil {
+				return cfg, warns, fmt.Errorf("bad banned_macs MAC %q: %w", m, err)
+			}
+			if meta.EquipmentType != "" && !stringInSlice(meta.EquipmentType, c.EquipmentTypes) {
+				warns = append(warns, fmt.Sprintf(
+					"warning: banned %s has unknown equipment_type %q; allowed: %v",
+					nm, meta.EquipmentType, c.EquipmentTypes))
+			}
+			if meta.ManagementType != "" && !stringInSlice(meta.ManagementType, c.ManagementTypes) {
+				warns = append(warns, fmt.Sprintf(
+					"warning: banned %s has unknown management_type %q; allowed: %v",
+					nm, meta.ManagementType, c.ManagementTypes))
+			}
+		}
+	}
+
+	return c, warns, nil
 }
 
 func formatEpoch(ts int64) string {
