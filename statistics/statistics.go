@@ -342,12 +342,12 @@ func PrintDetailsTable(title string, rows []DetailRow, assumeLeaseDur time.Durat
 
 // DrawSubnetGrid renders the entire IPv4 subnet (host range only) as a colour grid:
 //
-//	red       █ = leased (unexpired; from leases)
-//	brown     █ = reserved/fixed (from config.reservations; only if not actively leased)
-//	dark gray █ = banned/unusable IPs (exclusions, network/broadcast/server/gateway, declined)
-//	light gray█ = banned MAC leases (active leases owned by banned MACs)
-//	green     █ = free host IP inside the configured pools
-//	cyan      █ = unused host IP outside all configured pools
+//	red             █ = leased (unexpired; from leases)
+//	brown           █ = reserved/fixed (from config.reservations; only if not actively leased)
+//	dark gray       █ = banned/unusable IPs (exclusions, network/broadcast/server/gateway, declined)
+//	light gray      █ = banned MAC leases (active leases owned by banned MACs)
+//	green           █ = free host IP inside the configured pools
+//	dark dark gray  █ = unused host IP outside all configured pools
 func DrawSubnetGrid(
 	cfg config.Config,
 	iter LeaseIter,
@@ -361,11 +361,11 @@ func DrawSubnetGrid(
 	}
 
 	blkLeased := aurora.Red("█")
-	blkReserved := aurora.Brown("█")
+	blkReserved := aurora.Yellow("█")
 	blkBannedIP := aurora.Gray(8, "█")   // dark gray
 	blkBannedMAC := aurora.Gray(14, "█") // light gray
 	blkFree := aurora.Green("█")
-	blkUnused := aurora.Cyan("█")
+	blkUnused := aurora.Gray(3, "█")
 
 	_, ipnet, err := net.ParseCIDR(cfg.SubnetCIDR)
 	if err != nil {
