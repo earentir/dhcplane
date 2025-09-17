@@ -1,6 +1,7 @@
 package main
 
 import (
+	consoleui "dhcplane/concoleui"
 	"dhcplane/config"
 	"dhcplane/statistics"
 	"encoding/binary"
@@ -161,6 +162,39 @@ type LeaseDB struct {
 	Path    string `json:"-"`
 	dirty   bool   `json:"-"`
 	decline map[string]time.Time
+}
+
+// buildConsoleUI wires the generic console with our DHCP-specific counters and highlights.
+func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
+	ui := consoleui.New(consoleui.Options{
+		NoColour:     nocolour,
+		MaxLines:     maxLines,
+		MouseEnabled: true,
+		OnExit:       nil, // default immediate exit
+	})
+	ui.SetTitle("DHCPlane Console — Shortcuts & Help")
+
+	// Counters (data-driven; unlimited)
+	ui.RegisterCounter("REQUEST", false, "RPM", 60)
+	ui.RegisterCounter("ACK", false, "APM", 60)
+	// Add more at will:
+	// ui.RegisterCounter("DISCOVER", false, "DISC", 60)
+	// ui.RegisterCounter("NAK",      false, "NAK",  60)
+
+	// Highlights (case-sensitive where helpful)
+	ui.HighlightMap("BANNED-MAC", true, consoleui.Style{FG: "red", Attrs: "b"})
+	ui.HighlightMap("NAK", true, consoleui.Style{FG: "red", Attrs: "b"})
+	ui.HighlightMap("ACK", true, consoleui.Style{FG: "green", Attrs: "b"})
+	ui.HighlightMap("OFFER", true, consoleui.Style{FG: "green", Attrs: "b"})
+	ui.HighlightMap("REQUEST", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	ui.HighlightMap("DISCOVER", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	ui.HighlightMap("RELEASE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	ui.HighlightMap("DECLINE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+
+	// Example with background (optional):
+	// ui.HighlightMap("MAINT", false, consoleui.Style{BG: "#1e293b", Attrs: ""})
+
+	return ui
 }
 
 // NewLeaseDB creates a new LeaseDB instance.
@@ -1157,40 +1191,6 @@ func setupLogger(path string) (*log.Logger, *os.File, error) {
 	return lg, f, nil
 }
 
-// colourizeConsoleLine highlights key DHCP tokens (REQUEST, DISCOVER, OFFER, ACK, NAK, RELEASE, DECLINE, BANNED-MAC).
-// Green = success-ish, Yellow = info/normal verbs, Red = errors/NAKs/banned.
-func colourizeConsoleLine(line string, nocolour bool) string {
-	if nocolour {
-		return line
-	}
-	// Map important tokens to tview color tags.
-	repls := [][2]string{
-		{" BANNED-MAC", " [red::b]BANNED-MAC[-:-:-]"},
-		{" NAK", " [red::b]NAK[-:-:-]"},
-		{" ACK", " [green::b]ACK[-:-:-]"},
-		{" OFFER", " [green::b]OFFER[-:-:-]"},
-		{" REQUEST", " [yellow::b]REQUEST[-:-:-]"},
-		{" DISCOVER", " [yellow::b]DISCOVER[-:-:-]"},
-		{" RELEASE", " [yellow::b]RELEASE[-:-:-]"},
-		{" DECLINE", " [yellow::b]DECLINE[-:-:-]"},
-
-		{"-> NAK", "-> [red::b]NAK[-:-:-]"},
-		{"BANNED-MAC", "[red::b]BANNED-MAC[-:-:-]"},
-		{"NAK", "[red::b]NAK[-:-:-]"},
-		{"ACK", "[green::b]ACK[-:-:-]"},
-		{"OFFER", "[green::b]OFFER[-:-:-]"},
-		{"REQUEST", "[yellow::b]REQUEST[-:-:-]"},
-		{"DISCOVER", "[yellow::b]DISCOVER[-:-:-]"},
-		{"RELEASE", "[yellow::b]RELEASE[-:-:-]"},
-		{"DECLINE", "[yellow::b]DECLINE[-:-:-]"},
-	}
-	out := line
-	for _, rp := range repls {
-		out = strings.ReplaceAll(out, rp[0], rp[1])
-	}
-	return out
-}
-
 func (s *Server) logf(format string, args ...any) {
 	if s.logSink != nil {
 		s.logSink(format, args...)
@@ -1712,7 +1712,7 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		log.Printf("lease db load: %v (continuing with empty)", err)
 	}
 
-	// Logger (file)
+	// Logger (file only)
 	lg, f, err := setupLogger(logPath)
 	if err != nil {
 		return fmt.Errorf("logger: %w", err)
@@ -1724,19 +1724,23 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		}
 	}()
 
-	// Optional console UI
-	var ui *ConsoleUI
+	// Optional console UI (generic)
+	var ui *consoleui.UI
 	if console {
 		maxLines := cfg.ConsoleMaxLines
 		if maxLines <= 0 {
 			maxLines = 10000
 		}
-		ui = NewConsoleUI(nocolour, maxLines)
-		ui.Start()
+		ui = buildConsoleUI(nocolour, maxLines)
+		go func() {
+			if err := ui.Start(); err != nil {
+				log.Fatalf("console UI failed: %v", err)
+			}
+		}()
 		defer ui.Stop()
 	}
 
-	// Sinks
+	// Sinks (no colour pushed here; UI applies highlight rules)
 	logSink := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		if lg != nil {
@@ -1744,7 +1748,7 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		}
 		if ui != nil {
 			ts := time.Now().Format("2006/01/02 15:04:05.000000")
-			ui.Append(colourizeConsoleLine(ts+" "+msg, nocolour))
+			ui.Append(ts + " " + msg)
 		}
 	}
 	errorSink := func(format string, args ...any) {
@@ -1754,7 +1758,7 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		}
 		if ui != nil {
 			ts := time.Now().Format("2006/01/02 15:04:05.000000")
-			ui.Append(ts + " " + aurora.Red(msg).String())
+			ui.Append(ts + " " + msg)
 		}
 	}
 
@@ -1828,7 +1832,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 	var watcherErr error
 	if cfg.AutoReload {
 		watcher, watcherErr = startConfigWatcher(cfgPath, func(newCfg config.Config, newWarns []string) {
-			// Apply normalized+validated cfg
 			cfgAtomic.Store(&newCfg)
 			for _, w := range newWarns {
 				logSink("%s", w)
@@ -1839,7 +1842,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 					logSink("LEASE-COMPACT removed=%d (on auto-reload)", n)
 				}
 			}
-			// Rebind if interface changed
 			if newCfg.Interface != currentIface {
 				if err := bind(newCfg.Interface); err != nil {
 					logSink("AUTO-RELOAD: rebind failed for iface %q: %v (keeping %q)", newCfg.Interface, err, currentIface)
@@ -1865,8 +1867,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				logSink("RELOAD: config invalid, keeping old settings: %v", jerr)
 				continue
 			}
-
-			// Stamp/persist first_seen (unchanged behavior)
 			nowEpoch := time.Now().Unix()
 			changed := false
 			for k, v := range rawNew.Reservations {
@@ -1904,8 +1904,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 					}
 				}
 			}
-
-			// Validate + normalize
 			newCfg, newWarns, verr := config.ValidateAndNormalizeConfig(rawNew)
 			if verr != nil {
 				logSink("RELOAD: validation failed, keeping old settings: %v", verr)
@@ -1914,8 +1912,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 			for _, w := range newWarns {
 				logSink("%s", w)
 			}
-
-			// Apply
 			cfgAtomic.Store(&newCfg)
 			enforceReservationLeaseConsistency(db, &newCfg)
 			if newCfg.CompactOnLoad {
@@ -1923,7 +1919,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 					logSink("LEASE-COMPACT removed=%d (on config reload)", n)
 				}
 			}
-			// Rebind if interface changed
 			if newCfg.Interface != currentIface {
 				if err := bind(newCfg.Interface); err != nil {
 					logSink("RELOAD: rebind failed for iface %q: %v (keeping %q)", newCfg.Interface, err, currentIface)
@@ -1932,7 +1927,6 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				}
 			}
 			logSink("RELOAD: config applied")
-
 		case syscall.SIGINT, syscall.SIGTERM:
 			logSink("SIGNAL received, shutting down")
 			if srv != nil {
