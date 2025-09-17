@@ -31,7 +31,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var appVersion = "0.1.31"
+var appVersion = "0.1.33"
 
 /* ----------------- Config & Types ----------------- */
 
@@ -172,7 +172,7 @@ func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
 		MouseEnabled: true,
 		OnExit:       nil, // default immediate exit
 	})
-	ui.SetTitle("DHCPlane Console — Shortcuts & Help")
+	ui.SetTitle(fmt.Sprintf("DHCPlane Console v%s", appVersion))
 
 	// Counters (data-driven; unlimited)
 	ui.RegisterCounter("REQUEST", false, "RPM", 60)

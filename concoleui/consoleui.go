@@ -30,11 +30,12 @@ type Style struct {
 
 // Options defines options for the console UI.
 type Options struct {
-	NoColour     bool
-	MaxLines     int
-	MouseEnabled bool
-	HelpExtra    []string
-	OnExit       func(code int)
+	NoColour      bool
+	MaxLines      int
+	MouseEnabled  bool
+	HelpExtra     []string
+	OnExit        func(code int)
+	DisableTopBar bool // false = show top bar (Title | Counters); true = legacy: no top bar
 }
 
 type counterRule struct {
@@ -63,6 +64,7 @@ type UI struct {
 	statusText *tview.TextView
 	topSep     *tview.TextView
 	bottomSep  *tview.TextView
+	topBar     *tview.TextView // top bar with Title (left) | Counters (right)
 	root       tview.Primitive
 	modal      tview.Primitive
 	prevFocus  tview.Primitive
@@ -80,6 +82,7 @@ type UI struct {
 	title               string
 	helpExtra           []string
 	onExit              func(int)
+	topBarEnabled       bool // derived from !opts.DisableTopBar
 
 	// rules
 	counterMu  sync.Mutex
@@ -94,20 +97,21 @@ func New(opts Options) *UI {
 		opts.MaxLines = 10000
 	}
 	u := &UI{
-		app:     tview.NewApplication(),
-		logView: tview.NewTextView().SetScrollable(true).SetWrap(false),
-		inputField: tview.NewInputField().
-			SetLabel("> ").
-			SetFieldWidth(0),
-		statusText: tview.NewTextView().SetWrap(false),
-		topSep:     tview.NewTextView().SetWrap(false),
-		bottomSep:  tview.NewTextView().SetWrap(false),
-		lines:      make([]string, 0, opts.MaxLines),
-		maxLines:   opts.MaxLines,
-		mouseOn:    opts.MouseEnabled,
-		noColour:   opts.NoColour,
-		helpExtra:  append([]string(nil), opts.HelpExtra...),
+		app:           tview.NewApplication(),
+		logView:       tview.NewTextView().SetScrollable(true).SetWrap(false),
+		inputField:    tview.NewInputField().SetLabel("> ").SetFieldWidth(0),
+		statusText:    tview.NewTextView().SetWrap(false),
+		topSep:        tview.NewTextView().SetWrap(false),
+		bottomSep:     tview.NewTextView().SetWrap(false),
+		topBar:        tview.NewTextView().SetWrap(false),
+		lines:         make([]string, 0, opts.MaxLines),
+		maxLines:      opts.MaxLines,
+		mouseOn:       opts.MouseEnabled,
+		noColour:      opts.NoColour,
+		helpExtra:     append([]string(nil), opts.HelpExtra...),
+		topBarEnabled: !opts.DisableTopBar,
 	}
+
 	if opts.OnExit != nil {
 		u.onExit = opts.OnExit
 	} else {
@@ -124,15 +128,33 @@ func New(opts Options) *UI {
 	// colour mode for text views
 	u.logView.SetDynamicColors(!u.noColour)
 	u.statusText.SetDynamicColors(!u.noColour)
+	u.topBar.SetDynamicColors(!u.noColour)
 
 	// layout
-	root := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(u.topSep, 1, 0, false).
-		AddItem(u.logView, 0, 1, false).
-		AddItem(u.bottomSep, 1, 0, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(u.inputField, 1, 0, true).
-			AddItem(u.statusText, 1, 0, false), 2, 0, true)
+	var root *tview.Flex
+	if u.topBarEnabled {
+		// Top bar replaces the top border line.
+		root = tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(u.topBar, 1, 0, false).
+			AddItem(u.logView, 0, 1, false).
+			AddItem(u.bottomSep, 1, 0, false).
+			AddItem(
+				tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(u.inputField, 1, 0, true).
+					AddItem(u.statusText, 1, 0, false),
+				2, 0, true)
+	} else {
+		// Legacy mode: keep top border, no top bar.
+		root = tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(u.topSep, 1, 0, false).
+			AddItem(u.logView, 0, 1, false).
+			AddItem(u.bottomSep, 1, 0, false).
+			AddItem(
+				tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(u.inputField, 1, 0, true).
+					AddItem(u.statusText, 1, 0, false),
+				2, 0, true)
+	}
 	u.root = root
 
 	// behavior
@@ -141,7 +163,12 @@ func New(opts Options) *UI {
 	u.app.SetRoot(u.root, true)
 	u.app.SetFocus(u.inputField)
 	u.setLogSeparators(false) // input focused
-	u.updateBottomBarDirect() // <- initial status bar render
+
+	// Initial paint
+	if u.topBarEnabled {
+		u.updateTopBarDirect()
+	}
+	u.updateBottomBarDirect()
 
 	return u
 }
@@ -151,6 +178,9 @@ func (u *UI) SetTitle(s string) {
 	u.mu.Lock()
 	u.title = s
 	u.mu.Unlock()
+	if u.topBarEnabled {
+		u.updateTopBarDirect()
+	}
 }
 
 // Start runs the UI event loop. It blocks until the UI is stopped.
@@ -218,7 +248,10 @@ func (u *UI) Append(line string) {
 				u.logView.ScrollToEnd()
 			}
 		}
-		u.updateBottomBarDirect() // <- refresh counters/toggles display
+		if u.topBarEnabled {
+			u.updateTopBarDirect()
+		}
+		u.updateBottomBarDirect() // toggles and keys
 	})
 }
 
@@ -253,6 +286,9 @@ func (u *UI) Tick(label string) {
 			c.times = append(c.times, now)
 			break
 		}
+	}
+	if u.topBarEnabled {
+		u.updateTopBarDirect()
 	}
 }
 
@@ -458,7 +494,35 @@ func (u *UI) refreshDirect() {
 		fmt.Fprintln(u.logView, u.styleLine(l))
 	}
 	u.setLogSeparators(u.app.GetFocus() == u.logView)
+	if u.topBarEnabled {
+		u.updateTopBarDirect()
+	}
 	u.updateBottomBarDirect()
+}
+
+func (u *UI) bottomLeftStatus() string {
+	key := func(s string) string {
+		if u.noColour {
+			return s
+		}
+		return "[blue::b]" + s + "[-:-:-]"
+	}
+	// Keys/help only. (Counters are shown in the top bar when enabled.)
+	return fmt.Sprintf("%s help | %s switch | %s quit",
+		key("?"), key("Tab"), key("Ctrl+C"),
+	)
+}
+
+func (u *UI) legacyLeftStatus() string {
+	key := func(s string) string {
+		if u.noColour {
+			return s
+		}
+		return "[blue::b]" + s + "[-:-:-]"
+	}
+	return fmt.Sprintf("%s help | %s switch | %s quit%s",
+		key("?"), key("Tab"), key("Ctrl+C"), u.counterSnapshot(),
+	)
 }
 
 func (u *UI) leftStatus() string {
@@ -505,7 +569,12 @@ func (u *UI) updateBottomBarDirect() {
 	paused := u.paused
 	u.mu.Unlock()
 
-	left := u.leftStatus()
+	var left string
+	if u.topBarEnabled {
+		left = u.bottomLeftStatus() // no counters here
+	} else {
+		left = u.legacyLeftStatus() // legacy: counters remain on bottom
+	}
 	right := u.rightStatus(filterOn, caseOn, mouseOn, !paused)
 
 	_, _, w, _ := u.statusText.GetInnerRect()
@@ -520,6 +589,29 @@ func (u *UI) updateBottomBarDirect() {
 	u.statusText.SetText(left + strings.Repeat(" ", pad) + right)
 }
 
+func (u *UI) updateTopBarDirect() {
+	if !u.topBarEnabled {
+		return
+	}
+	u.mu.Lock()
+	title := u.title
+	u.mu.Unlock()
+
+	left := title
+	right := u.counterSnapshot()
+
+	_, _, w, _ := u.topBar.GetInnerRect()
+	if w <= 0 {
+		u.topBar.SetText(left + "  " + right)
+		return
+	}
+	pad := w - visualLen(left) - visualLen(right)
+	if pad < 1 {
+		pad = 1
+	}
+	u.topBar.SetText(left + strings.Repeat(" ", pad) + right)
+}
+
 func (u *UI) setLogSeparators(focused bool) {
 	_, _, w, _ := u.logView.GetInnerRect()
 	if w <= 0 {
@@ -530,7 +622,11 @@ func (u *UI) setLogSeparators(focused bool) {
 		ch = '═'
 	}
 	line := strings.Repeat(string(ch), w)
-	u.topSep.SetText(line)
+
+	// Top line only when top bar is disabled (legacy mode)
+	if !u.topBarEnabled {
+		u.topSep.SetText(line)
+	}
 	u.bottomSep.SetText(line)
 }
 
@@ -698,11 +794,22 @@ func (u *UI) showHelpModal() {
 		"  Type text to set filter pattern",
 		"  Enter               Enable/Disable filter (keeps text)",
 		"  Esc                 Clear & disable filter",
-		"",
-		"Status Bar",
-		"  Shows counters and toggles. Mouse badge is green when you can select with the mouse",
-		"  (i.e., tview mouse handling is OFF).",
 	}
+	if u.topBarEnabled {
+		lines = append(lines, "",
+			"Top Bar",
+			"  Shows Title (left) and registered counters (right).")
+	} else {
+		lines = append(lines, "",
+			"Bottom Status",
+			"  Shows keys and counters (legacy mode).")
+	}
+	lines = append(lines, "",
+		"Status Bar",
+		"  Shows keys on the left and toggles on the right. Mouse badge is green when you can",
+		"  select with the mouse (i.e., tview mouse handling is OFF).",
+	)
+
 	if len(u.helpExtra) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, u.helpExtra...)
