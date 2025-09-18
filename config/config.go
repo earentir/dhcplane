@@ -150,6 +150,15 @@ type Config struct {
 	Logging LoggingConfig `json:"logging"`
 
 	DetectDHCPServers DHCPServerDetectionConfig `json:"detect_dhcp_servers,omitempty"`
+
+	ARPAnomalyDetection ARPAnomalyDetectionConfig `json:"arp_anomaly_detection,omitempty"`
+}
+
+// ARPAnomalyDetectionConfig holds settings for ARP anomaly detection.
+type ARPAnomalyDetectionConfig struct {
+	Enabled       bool `json:"enabled,omitempty"`
+	ProbeInterval int  `json:"probe_interval,omitempty"` // seconds, default 1800
+	FirstScan     int  `json:"first_scan,omitempty"`     // seconds, default 60
 }
 
 // DHCPServerDetectionConfig holds settings for DHCP server detection.

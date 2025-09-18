@@ -72,8 +72,8 @@ func (db *LeaseDB) Load() error {
 
 	// First try the canonical struct shape.
 	type fileShape struct {
-		ByIP  map[string]Lease `json:"by_ip"`
-		ByMAC map[string]Lease `json:"by_mac"`
+		ByIP  map[string]Lease `json:"ByIP"`
+		ByMAC map[string]Lease `json:"ByMAC"`
 	}
 	var tmp fileShape
 	dec := json.NewDecoder(f)
@@ -130,14 +130,14 @@ func (db *LeaseDB) Load() error {
 	}
 	byIP := map[string]Lease{}
 	byMAC := map[string]Lease{}
-	if bip, ok := raw["by_ip"].(map[string]any); ok {
+	if bip, ok := raw["ByIP"].(map[string]any); ok {
 		for ip, v := range bip {
 			if lease, ok := coerce(v); ok {
 				byIP[ip] = lease
 			}
 		}
 	}
-	if bmac, ok := raw["by_mac"].(map[string]any); ok {
+	if bmac, ok := raw["ByMAC"].(map[string]any); ok {
 		for mac, v := range bmac {
 			if lease, ok := coerce(v); ok {
 				byMAC[mac] = lease
@@ -379,7 +379,7 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 	}
 	authoritative := s.authorGet()
 	_, subnet := mustCIDR(cfg.SubnetCIDR)
-	serverIP := parseIP4(cfg.ServerIP)
+	serverIP := ParseIP4(cfg.ServerIP)
 
 	mt := req.MessageType()
 	dispMAC := macDisplay(req.ClientHWAddr)
@@ -540,7 +540,7 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 
 func (s *Server) isExcluded(cfg *config.Config, ip net.IP) bool {
 	for _, e := range cfg.Exclusions {
-		if ip.Equal(parseIP4(e)) {
+		if ip.Equal(ParseIP4(e)) {
 			return true
 		}
 	}
@@ -562,8 +562,8 @@ func (s *Server) macForReservedIP(cfg *config.Config, ip net.IP) string {
 // chooseIPForMAC implements the same 5-step policy as before.
 func (s *Server) chooseIPForMAC(cfg *config.Config, mac string) (net.IP, bool) {
 	_, subnet := mustCIDR(cfg.SubnetCIDR)
-	serverIP := parseIP4(cfg.ServerIP)
-	gatewayIP := parseIP4(cfg.Gateway)
+	serverIP := ParseIP4(cfg.ServerIP)
+	gatewayIP := ParseIP4(cfg.Gateway)
 	isBad := func(ip net.IP) bool {
 		if !ipInSubnet(ip, subnet) || s.isExcluded(cfg, ip) || s.db.IsDeclined(ip.String()) {
 			return true
@@ -572,7 +572,7 @@ func (s *Server) chooseIPForMAC(cfg *config.Config, mac string) (net.IP, bool) {
 			return true
 		}
 		network := subnet.IP.Mask(subnet.Mask)
-		bcast := broadcastAddr(subnet)
+		bcast := BroadcastAddr(subnet)
 		if ip.Equal(network) || ip.Equal(bcast) {
 			return true
 		}
@@ -583,7 +583,7 @@ func (s *Server) chooseIPForMAC(cfg *config.Config, mac string) (net.IP, bool) {
 	}
 	// 1) Reservation
 	if rv, ok := cfg.Reservations[mac]; ok {
-		ip := parseIP4(rv.IP)
+		ip := ParseIP4(rv.IP)
 		if ip == nil || isBad(ip) {
 			return nil, false
 		}
@@ -607,9 +607,9 @@ func (s *Server) chooseIPForMAC(cfg *config.Config, mac string) (net.IP, bool) {
 	}
 	// 3) Brand-new IPs
 	for _, p := range cfg.Pools {
-		start := parseIP4(p.Start)
-		end := parseIP4(p.End)
-		for ip := start; ipToU32(ip) <= ipToU32(end); ip = incIP(ip) {
+		start := ParseIP4(p.Start)
+		end := ParseIP4(p.End)
+		for ip := start; IPToU32(ip) <= IPToU32(end); ip = IncIP(ip) {
 			if isBad(ip) {
 				continue
 			}
@@ -620,9 +620,9 @@ func (s *Server) chooseIPForMAC(cfg *config.Config, mac string) (net.IP, bool) {
 	}
 	// 4) Recycle expired safe IPs
 	for _, p := range cfg.Pools {
-		start := parseIP4(p.Start)
-		end := parseIP4(p.End)
-		for ip := start; ipToU32(ip) <= ipToU32(end); ip = incIP(ip) {
+		start := ParseIP4(p.Start)
+		end := ParseIP4(p.End)
+		for ip := start; IPToU32(ip) <= IPToU32(end); ip = IncIP(ip) {
 			if isBad(ip) {
 				continue
 			}
@@ -643,8 +643,8 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 		return nil, err
 	}
 	_, subnet := mustCIDR(cfg.SubnetCIDR)
-	serverIP := parseIP4(cfg.ServerIP)
-	gatewayIP := parseIP4(cfg.Gateway)
+	serverIP := ParseIP4(cfg.ServerIP)
+	gatewayIP := ParseIP4(cfg.Gateway)
 
 	resp.UpdateOption(dhcpv4.OptMessageType(typ))
 	resp.YourIPAddr = yiaddr.To4()
@@ -697,7 +697,7 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 			if err != nil {
 				return nil, fmt.Errorf("bad CIDR %q: %w", r.CIDR, err)
 			}
-			gw := parseIP4(r.Gateway)
+			gw := ParseIP4(r.Gateway)
 			rs = append(rs, &dhcpv4.Route{Dest: ipnet, Router: gw})
 		}
 		resp.UpdateOption(dhcpv4.OptClasslessStaticRoute(rs...)) // 121
@@ -714,7 +714,7 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 
 	// 28 Broadcast Address
 	if cfg.EnableBroadcast28 {
-		if b := broadcastAddr(subnet).To4(); b != nil {
+		if b := BroadcastAddr(subnet).To4(); b != nil {
 			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(28), []byte(b)))
 		}
 	}
@@ -933,7 +933,8 @@ func mustCIDR(c string) (net.IP, *net.IPNet) {
 	return ip, n
 }
 
-func parseIP4(s string) net.IP {
+// ParseIP4 parses and panics if invalid or not IPv4.
+func ParseIP4(s string) net.IP {
 	ip := net.ParseIP(strings.TrimSpace(s)).To4()
 	if ip == nil {
 		panic(fmt.Errorf("bad IPv4 %q", s))
@@ -951,7 +952,8 @@ func toIPs(list []string) []net.IP {
 	return ips
 }
 
-func ipToU32(ip net.IP) uint32 { return binary.BigEndian.Uint32(ip.To4()) }
+// IPToU32 panics if ip is not 4 bytes.
+func IPToU32(ip net.IP) uint32 { return binary.BigEndian.Uint32(ip.To4()) }
 
 func u32ToIP(v uint32) net.IP {
 	b := make([]byte, 4)
@@ -959,11 +961,13 @@ func u32ToIP(v uint32) net.IP {
 	return net.IP(b)
 }
 
-func incIP(ip net.IP) net.IP { return u32ToIP(ipToU32(ip) + 1) }
+// IncIP returns ip+1. Panics if ip is not 4 bytes.
+func IncIP(ip net.IP) net.IP { return u32ToIP(IPToU32(ip) + 1) }
 
 func ipInSubnet(ip net.IP, n *net.IPNet) bool { return n.Contains(ip) }
 
-func broadcastAddr(n *net.IPNet) net.IP {
+// BroadcastAddr calculates the broadcast address for a subnet.
+func BroadcastAddr(n *net.IPNet) net.IP {
 	ip := n.IP.To4()
 	mask := net.IP(n.Mask).To4()
 	var b [4]byte
