@@ -1,9 +1,4 @@
 // Package statistics contains allocation counting, lease classification,
-// whole-subnet detail building, and console rendering (tables / grid).
-// It does not read files or environment variables; callers must provide:
-//   - the live config.Config
-//   - a LeaseIter to walk current leases without duplicating data
-//   - predicates for declined IPs and banned MACs
 package statistics
 
 import (

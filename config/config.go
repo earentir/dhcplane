@@ -1,5 +1,4 @@
 // Package config holds the JSON-config-related data types and logic
-// that were previously in main. All original comments are preserved.
 package config
 
 import (

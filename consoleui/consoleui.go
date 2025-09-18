@@ -1,11 +1,4 @@
 // Package consoleui provides a generic, tview-based console with:
-// - scrolling log view
-// - input-line filter (enter toggles, esc clears, 'c' toggles case)
-// - status bar (counters + toggles: Filter/Case/Mouse/Running)
-// - help modal ('?')
-// - pause/autoscroll (' '), mouse toggle ('m'), quick quit (Ctrl+C / q)
-//
-// It is fully app-agnostic. Apps register counters and highlight rules at runtime.
 package consoleui
 
 import (
