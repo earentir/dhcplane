@@ -669,7 +669,9 @@ func main() {
 				})
 			})
 			// Keep stable order by IP
-			sort.Slice(rows, func(i, j int) bool { return rows[i].IP < rows[j].IP })
+			sort.Slice(rows, func(i, j int) bool {
+				return ipKey(rows[i].IP) < ipKey(rows[j].IP)
+			})
 
 			if jsonOut {
 				b, _ := json.MarshalIndent(rows, "", "  ")
@@ -978,6 +980,16 @@ func main() {
 			if err != nil {
 				return err
 			}
+
+			// numeric IPv4 sort with iface tie-breaker
+			sort.Slice(entries, func(i, j int) bool {
+				ki, kj := ipKey(entries[i].IP), ipKey(entries[j].IP)
+				if ki == kj {
+					return entries[i].Iface < entries[j].Iface
+				}
+				return ki < kj
+			})
+
 			if arpJSON {
 				b, _ := json.MarshalIndent(entries, "", "  ")
 				fmt.Println(string(b))
@@ -1405,10 +1417,11 @@ func mergeARP(a, b []arpEntry) []arpEntry {
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].IP == out[j].IP {
+		ki, kj := ipKey(out[i].IP), ipKey(out[j].IP)
+		if ki == kj {
 			return out[i].Iface < out[j].Iface
 		}
-		return out[i].IP < out[j].IP
+		return ki < kj
 	})
 	return out
 }
@@ -1547,4 +1560,12 @@ func ensureDefaultConfig(cfgPath string) error {
 
 type ioCloser interface {
 	Close() error
+}
+
+func ipKey(s string) uint32 {
+	ip := net.ParseIP(s).To4()
+	if ip == nil {
+		return ^uint32(0)
+	}
+	return dhcpserver.IPToU32(ip)
 }
