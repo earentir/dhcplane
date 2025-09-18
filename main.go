@@ -903,34 +903,51 @@ func ensureDefaultConfig(cfgPath string) error {
 
 	// Default: 192.168.1.0/24
 	def := map[string]any{
-		"interface":              "",
-		"server_ip":              "192.168.1.2",
-		"subnet_cidr":            "192.168.1.0/24",
-		"gateway":                "192.168.1.1",
-		"compact_on_load":        false,
-		"dns":                    []string{"192.168.1.1", "1.1.1.1"},
-		"domain":                 "lan",
-		"lease_seconds":          3600,
-		"lease_sticky_seconds":   3600,
-		"auto_reload":            true,
-		"pools":                  []map[string]string{{"start": "192.168.1.100", "end": "192.168.1.200"}},
-		"exclusions":             []string{"192.168.1.1", "192.168.1.2"},
-		"reservations":           map[string]any{},
-		"ntp":                    []string{},
-		"mtu":                    0,
-		"tftp_server_name":       "",
-		"bootfile_name":          "",
-		"wpad_url":               "",
-		"wins":                   []string{},
-		"domain_search":          []string{},
-		"static_routes":          []map[string]string{},
-		"mirror_routes_to_249":   false,
-		"vendor_specific_43_hex": "",
-		"device_overrides":       map[string]any{},
-		"banned_macs":            map[string]any{},
-		"equipment_types":        []string{},
-		"management_types":       []string{},
-		"console_max_lines":      10000,
+		"interface":                "",
+		"server_ip":                "192.168.1.2",
+		"subnet_cidr":              "192.168.1.0/24",
+		"gateway":                  "192.168.1.1",
+		"compact_on_load":          false,
+		"dns":                      []string{"192.168.1.1", "1.1.1.1"},
+		"domain":                   "lan",
+		"lease_seconds":            3600,
+		"lease_sticky_seconds":     3600,
+		"auto_reload":              true,
+		"pools":                    []map[string]string{{"start": "192.168.1.100", "end": "192.168.1.200"}},
+		"exclusions":               []string{"192.168.1.1", "192.168.1.2"},
+		"reservations":             map[string]any{},
+		"ntp":                      []string{},
+		"mtu":                      0,
+		"tftp_server_name":         "",
+		"bootfile_name":            "",
+		"wpad_url":                 "",
+		"wins":                     []string{},
+		"domain_search":            []string{},
+		"static_routes":            []map[string]string{},
+		"mirror_routes_to_249":     false,
+		"vendor_specific_43_hex":   "",
+		"device_overrides":         map[string]any{},
+		"vendor_class_overrides":   map[string]any{}, // Vendor Class overrides (by option 60 string)
+		"enable_broadcast_28":      false,
+		"use_classful_routes_33":   false,
+		"routes_33":                []map[string]string{}, // {"destination":"a.b.c.0","gateway":"x.y.z.w"}
+		"netbios_node_type_46":     0,                     // 0 omit, else {1,2,4,8}
+		"netbios_scope_id_47":      "",
+		"max_dhcp_message_size_57": 0,          // 0 omit, else >=576
+		"tftp_servers_150":         []string{}, // list of IPv4s
+		"echo_relay_agent_info_82": false,
+		"banned_macs":              map[string]any{},
+		"equipment_types":          []string{},
+		"management_types":         []string{},
+		"console_max_lines":        10000,
+		"logging": map[string]any{
+			"path":        "",
+			"filename":    "dhcplane.log",
+			"max_size":    20, // MB
+			"max_backups": 5,
+			"max_age":     0,    // days; 0 = no age-based purge
+			"compress":    true, // gzip (lumberjack)
+		},
 	}
 
 	b, _ := json.MarshalIndent(def, "", "  ")

@@ -79,6 +79,14 @@ func (r *Reservations) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// StaticRoute33 represents a classful route for DHCP option 33.
+type StaticRoute33 struct {
+	Destination string `json:"destination"` // dotted-quad network (classful: a.0.0.0 | a.b.0.0 | a.b.c.0)
+	Gateway     string `json:"gateway"`     // IPv4
+}
+
+// config/config.go
+
 // Config represents the DHCP server configuration.
 type Config struct {
 	Interface     string   `json:"interface,omitempty"`
@@ -99,25 +107,43 @@ type Config struct {
 
 	NTP            []string `json:"ntp,omitempty"`
 	MTU            int      `json:"mtu,omitempty"`
-	TFTPServerName string   `json:"tftp_server_name,omitempty"`
-	BootFileName   string   `json:"bootfile_name,omitempty"`
+	TFTPServerName string   `json:"tftp_server_name,omitempty"` // opt 66
+	BootFileName   string   `json:"bootfile_name,omitempty"`    // opt 67
 	WPADURL        string   `json:"wpad_url,omitempty"`
 	WINS           []string `json:"wins,omitempty"`
 
 	DomainSearch        []string                  `json:"domain_search,omitempty"`
 	StaticRoutes        []StaticRoute             `json:"static_routes,omitempty"`
 	MirrorRoutesTo249   bool                      `json:"mirror_routes_to_249,omitempty"`
-	VendorSpecific43Hex string                    `json:"vendor_specific_43_hex,omitempty"`
+	VendorSpecific43Hex string                    `json:"vendor_specific_43_hex,omitempty"` // opt 43 (hex payload)
 	DeviceOverrides     map[string]DeviceOverride `json:"device_overrides,omitempty"`
 
-	// Config-based banned MACs with metadata (optional feature)
+	// suggest hostname (opt 12) when client does not supply one
+	Hostname12 string `json:"hostname_12,omitempty"`
+
+	// per Vendor Class Identifier (opt 60) overrides
+	VendorClassOverrides map[string]DeviceOverride `json:"vendor_class_overrides,omitempty"`
+
+	// per User Class (opt 77) overrides
+	UserClassOverrides77 map[string]DeviceOverride `json:"user_class_overrides_77,omitempty"`
+
+	EnableBroadcast28    bool            `json:"enable_broadcast_28,omitempty"`
+	UseClassfulRoutes33  bool            `json:"use_classful_routes_33,omitempty"`
+	Routes33             []StaticRoute33 `json:"routes_33,omitempty"`
+	NetBIOSNodeType46    uint8           `json:"netbios_node_type_46,omitempty"`
+	NetBIOSScopeID47     string          `json:"netbios_scope_id_47,omitempty"`
+	MaxDHCPMessageSize57 uint16          `json:"max_dhcp_message_size_57,omitempty"`
+	TFTPServers150       []string        `json:"tftp_servers_150,omitempty"`
+	EchoRelayAgentInfo82 bool            `json:"echo_relay_agent_info_82,omitempty"`
+
+	// Config-based banned MACs with metadata
 	BannedMACs map[string]DeviceMeta `json:"banned_macs,omitempty"`
 
-	// Allowed enumerations (user-extendable)
-	EquipmentTypes  []string `json:"equipment_types,omitempty"`  // e.g., Switch, Router, AP, Modem, Gateway
-	ManagementTypes []string `json:"management_types,omitempty"` // e.g., ssh, web, telnet, serial, console
+	// Allowed enumerations
+	EquipmentTypes  []string `json:"equipment_types,omitempty"`
+	ManagementTypes []string `json:"management_types,omitempty"`
 
-	//Max console buffer
+	// Max console buffer
 	ConsoleMaxLines int `json:"console_max_lines,omitempty"`
 
 	// Log rotation settings
@@ -267,9 +293,7 @@ func ParseHexPayload(s string) ([]byte, error) {
 	return hex.DecodeString(s)
 }
 
-// ValidateAndNormalizeConfig applies defaults, normalizes MAC-keyed maps,
-// validates option 43, and returns any warnings to log.
-// It returns a COPY of cfg with fixes applied.
+// ValidateAndNormalizeConfig applies defaults, normalizes MAC-keyed maps, it returns a COPY of cfg with fixes applied.
 func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 	c := cfg
 	var warns []string
@@ -322,6 +346,16 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		c.DeviceOverrides = norm
 	}
 
+	// VendorClassOverrides: keyed by raw option-60 string
+	if c.VendorClassOverrides == nil {
+		c.VendorClassOverrides = make(map[string]DeviceOverride)
+	}
+
+	// UserClassOverrides77: keyed by user-class string(s)
+	if c.UserClassOverrides77 == nil {
+		c.UserClassOverrides77 = make(map[string]DeviceOverride)
+	}
+
 	if s := strings.TrimSpace(c.VendorSpecific43Hex); s != "" {
 		if _, err := ParseHexPayload(s); err != nil {
 			return cfg, warns, fmt.Errorf("vendor_specific_43_hex: %w", err)
@@ -347,10 +381,48 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		}
 	}
 
-	// Logging defaults and validation (applies when logging is present)
+	// Validate Routes33 if enabled
+	if c.UseClassfulRoutes33 {
+		for i, r := range c.Routes33 {
+			gw := parseIPv4(r.Gateway)
+			if gw == nil {
+				return cfg, warns, fmt.Errorf("routes_33[%d]: bad gateway %q", i, r.Gateway)
+			}
+			octs := strings.Split(r.Destination, ".")
+			if len(octs) != 4 {
+				return cfg, warns, fmt.Errorf("routes_33[%d]: bad destination %q", i, r.Destination)
+			}
+			classful := (octs[1] == "0" && octs[2] == "0" && octs[3] == "0") ||
+				(octs[2] == "0" && octs[3] == "0") ||
+				(octs[3] == "0")
+			if !classful || parseIPv4(r.Destination) == nil {
+				return cfg, warns, fmt.Errorf("routes_33[%d]: destination %q must be classful network (a.0.0.0 | a.b.0.0 | a.b.c.0)", i, r.Destination)
+			}
+		}
+	}
+
+	if c.NetBIOSNodeType46 != 0 {
+		switch c.NetBIOSNodeType46 {
+		case 1, 2, 4, 8:
+		default:
+			return cfg, warns, fmt.Errorf("netbios_node_type_46 must be one of {1,2,4,8}")
+		}
+	}
+
+	if c.MaxDHCPMessageSize57 != 0 && c.MaxDHCPMessageSize57 < 576 {
+		return cfg, warns, fmt.Errorf("max_dhcp_message_size_57 must be >= 576")
+	}
+
+	for i, s := range c.TFTPServers150 {
+		if parseIPv4(s) == nil {
+			return cfg, warns, fmt.Errorf("tftp_servers_150[%d]: bad IPv4 %q", i, s)
+		}
+	}
+
+	// Logging defaults and validation
 	if c.Logging.Path != "" || c.Logging.Filename != "" {
 		if c.Logging.MaxSize <= 0 {
-			c.Logging.MaxSize = 20 // MB
+			c.Logging.MaxSize = 20
 		}
 		if c.Logging.MaxBackups < 0 {
 			return cfg, warns, fmt.Errorf("logging.max_backups must be >= 0")
@@ -361,7 +433,6 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		if c.Logging.MaxAge < 0 {
 			return cfg, warns, fmt.Errorf("logging.max_age must be >= 0")
 		}
-		// Default to gzip compression when not specified
 		if !c.Logging.Compress {
 			c.Logging.Compress = true
 		}

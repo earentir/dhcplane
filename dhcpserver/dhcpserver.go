@@ -370,7 +370,7 @@ func (s *Server) errorf(format string, args ...any) {
 	}
 }
 
-// Handler processes a single DHCPv4 request. Behavior is preserved.
+// Handler processes a single DHCPv4 request.
 func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {
 	cfg := s.cfgGet()
 	if cfg == nil {
@@ -429,6 +429,12 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		if err != nil {
 			s.logf("offer build error for %s: %v", dispMAC, err)
 			return
+		}
+		// echo relay agent info if configured
+		if cfg.EchoRelayAgentInfo82 {
+			if ra := req.Options.Get(dhcpv4.OptionRelayAgentInformation); len(ra) > 0 {
+				offer.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionRelayAgentInformation, ra))
+			}
 		}
 		s.logf("OFFER %s -> %s", dispMAC, ip.String())
 		_, _ = conn.WriteTo(offer.ToBytes(), peer)
@@ -500,6 +506,12 @@ func (s *Server) Handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		if err != nil {
 			s.logf("ack build error for %s ip=%s: %v", dispMAC, reqIP, err)
 			return
+		}
+		// echo relay agent info if configured
+		if cfg.EchoRelayAgentInfo82 {
+			if ra := req.Options.Get(dhcpv4.OptionRelayAgentInformation); len(ra) > 0 {
+				ack.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionRelayAgentInformation, ra))
+			}
 		}
 		lease := Lease{MAC: mac, IP: reqIP.String(), Hostname: hostname, AllocatedAt: now, Expiry: now + int64(cfg.LeaseSeconds), FirstSeen: firstSeen}
 		s.db.Set(lease)
@@ -646,6 +658,10 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 	if len(cfg.DNS) > 0 {
 		resp.UpdateOption(dhcpv4.OptDNS(toIPs(cfg.DNS)...))
 	}
+	// 12 Host Name suggestion only if client did not send one
+	if cfg.Hostname12 != "" && len(req.Options.Get(dhcpv4.OptionHostName)) == 0 {
+		resp.UpdateOption(dhcpv4.OptHostName(cfg.Hostname12))
+	}
 	if cfg.Domain != "" {
 		resp.UpdateOption(dhcpv4.OptDomainName(cfg.Domain))
 	}
@@ -658,11 +674,11 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(26), mtu))
 	}
 	if cfg.TFTPServerName != "" {
-		resp.UpdateOption(dhcpv4.OptTFTPServerName(cfg.TFTPServerName))
+		resp.UpdateOption(dhcpv4.OptTFTPServerName(cfg.TFTPServerName)) // 66
 	}
 	if cfg.BootFileName != "" {
 		resp.BootFileName = cfg.BootFileName
-		resp.UpdateOption(dhcpv4.OptBootFileName(cfg.BootFileName))
+		resp.UpdateOption(dhcpv4.OptBootFileName(cfg.BootFileName)) // 67
 	}
 	if cfg.WPADURL != "" {
 		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(252), []byte(cfg.WPADURL)))
@@ -672,7 +688,7 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 	}
 	if len(cfg.DomainSearch) > 0 {
 		lbls := &rfc1035label.Labels{Labels: append([]string(nil), cfg.DomainSearch...)}
-		resp.UpdateOption(dhcpv4.OptDomainSearch(lbls))
+		resp.UpdateOption(dhcpv4.OptDomainSearch(lbls)) // 119
 	}
 	if len(cfg.StaticRoutes) > 0 {
 		var rs []*dhcpv4.Route
@@ -684,7 +700,7 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 			gw := parseIP4(r.Gateway)
 			rs = append(rs, &dhcpv4.Route{Dest: ipnet, Router: gw})
 		}
-		resp.UpdateOption(dhcpv4.OptClasslessStaticRoute(rs...))
+		resp.UpdateOption(dhcpv4.OptClasslessStaticRoute(rs...)) // 121
 		if cfg.MirrorRoutesTo249 {
 			b := dhcpv4.Routes(rs).ToBytes()
 			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(249), b))
@@ -692,9 +708,65 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 	}
 	if cfg.VendorSpecific43Hex != "" {
 		if v43, err := config.ParseHexPayload(cfg.VendorSpecific43Hex); err == nil && len(v43) > 0 {
-			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, v43))
+			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, v43)) // 43
 		}
 	}
+
+	// 28 Broadcast Address
+	if cfg.EnableBroadcast28 {
+		if b := broadcastAddr(subnet).To4(); b != nil {
+			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(28), []byte(b)))
+		}
+	}
+
+	// 33 Classful Static Routes
+	if cfg.UseClassfulRoutes33 && len(cfg.Routes33) > 0 {
+		var buf []byte
+		for _, r := range cfg.Routes33 {
+			dst := net.ParseIP(strings.TrimSpace(r.Destination)).To4()
+			gw := net.ParseIP(strings.TrimSpace(r.Gateway)).To4()
+			if dst == nil || gw == nil {
+				continue
+			}
+			buf = append(buf, dst...)
+			buf = append(buf, gw...)
+		}
+		if len(buf) > 0 {
+			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(33), buf))
+		}
+	}
+
+	// 46 NetBIOS node type
+	if cfg.NetBIOSNodeType46 != 0 {
+		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(46), []byte{byte(cfg.NetBIOSNodeType46)}))
+	}
+
+	// 47 NetBIOS scope ID
+	if cfg.NetBIOSScopeID47 != "" {
+		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(47), []byte(cfg.NetBIOSScopeID47)))
+	}
+
+	// 57 Maximum DHCP Message Size
+	if cfg.MaxDHCPMessageSize57 != 0 {
+		msz := make([]byte, 2)
+		binary.BigEndian.PutUint16(msz, cfg.MaxDHCPMessageSize57)
+		resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(57), msz))
+	}
+
+	// 150 TFTP server addresses
+	if len(cfg.TFTPServers150) > 0 {
+		var buf []byte
+		for _, s := range cfg.TFTPServers150 {
+			if ip := net.ParseIP(strings.TrimSpace(s)).To4(); ip != nil {
+				buf = append(buf, ip...)
+			}
+		}
+		if len(buf) > 0 {
+			resp.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(150), buf))
+		}
+	}
+
+	// MAC-based overrides
 	if ov, has := cfg.DeviceOverrides[mac]; has {
 		if len(ov.DNS) > 0 {
 			resp.UpdateOption(dhcpv4.OptDNS(toIPs(ov.DNS)...))
@@ -707,7 +779,61 @@ func (s *Server) buildReply(cfg *config.Config, req *dhcpv4.DHCPv4, typ dhcpv4.M
 			resp.UpdateOption(dhcpv4.OptBootFileName(ov.BootFileName))
 		}
 	}
+
+	// 60 Vendor Class Identifier based overrides
+	if vci := strings.TrimRight(string(req.Options.Get(dhcpv4.OptionClassIdentifier)), "\x00"); vci != "" {
+		if ov, ok := cfg.VendorClassOverrides[vci]; ok {
+			if len(ov.DNS) > 0 {
+				resp.UpdateOption(dhcpv4.OptDNS(toIPs(ov.DNS)...))
+			}
+			if ov.TFTPServerName != "" {
+				resp.UpdateOption(dhcpv4.OptTFTPServerName(ov.TFTPServerName))
+			}
+			if ov.BootFileName != "" {
+				resp.BootFileName = ov.BootFileName
+				resp.UpdateOption(dhcpv4.OptBootFileName(ov.BootFileName))
+			}
+		}
+	}
+
+	// 77 User Class based overrides (multiple classes possible)
+	if raw := req.Options.Get(dhcpv4.GenericOptionCode(77)); len(raw) > 0 {
+		for _, cls := range parseUserClass77(raw) {
+			if ov, ok := cfg.UserClassOverrides77[cls]; ok {
+				if len(ov.DNS) > 0 {
+					resp.UpdateOption(dhcpv4.OptDNS(toIPs(ov.DNS)...))
+				}
+				if ov.TFTPServerName != "" {
+					resp.UpdateOption(dhcpv4.OptTFTPServerName(ov.TFTPServerName))
+				}
+				if ov.BootFileName != "" {
+					resp.BootFileName = ov.BootFileName
+					resp.UpdateOption(dhcpv4.OptBootFileName(ov.BootFileName))
+				}
+			}
+		}
+	}
+
 	return resp, nil
+}
+
+// parseUserClass77 parses RFC 3004 user-class data into a slice of strings.
+func parseUserClass77(b []byte) []string {
+	var out []string
+	for i := 0; i < len(b); {
+		l := int(b[i])
+		i++
+		if l == 0 || i+l > len(b) {
+			break
+		}
+		out = append(out, string(b[i:i+l]))
+		i += l
+	}
+	// Fallback: if TLV parse failed, treat as single opaque string
+	if len(out) == 0 && len(b) > 0 {
+		out = append(out, string(b))
+	}
+	return out
 }
 
 /* ----------------- Cross-package helpers (exported) ----------------- */
