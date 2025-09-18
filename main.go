@@ -470,7 +470,7 @@ func main() {
 		},
 	}
 	root.PersistentFlags().BoolVarP(&showVersion, "version", "", false, "Print version and exit")
-	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.config", "Path to JSON config")
+	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.json", "Path to JSON config")
 	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
 	root.PersistentFlags().BoolVar(&authoritative, "authoritative", true, "Send NAKs on invalid requests")
 	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path (empty to log only to console)")
