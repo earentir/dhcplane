@@ -525,19 +525,6 @@ func (u *UI) legacyLeftStatus() string {
 	)
 }
 
-func (u *UI) leftStatus() string {
-	key := func(s string) string {
-		if u.noColour {
-			return s
-		}
-		return "[blue::b]" + s + "[-:-:-]"
-	}
-	// keys + counters (built by counterSnapshot)
-	return fmt.Sprintf("%s help | %s switch | %s quit%s",
-		key("?"), key("Tab"), key("Ctrl+C"), u.counterSnapshot(),
-	)
-}
-
 func (u *UI) rightStatus(filterOn, caseOn, mouseOn, running bool) string {
 	// Here, "active" (green) should mean: user can select with mouse.
 	// That happens when tview mouse is DISABLED (mouseOn == false).

@@ -1,8 +1,8 @@
 package main
 
 import (
-	consoleui "dhcplane/concoleui"
 	"dhcplane/config"
+	"dhcplane/consoleui"
 	"dhcplane/statistics"
 	"encoding/binary"
 	"encoding/json"
@@ -31,7 +31,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var appVersion = "0.1.33"
+var appVersion = "0.1.35"
+var transparent bool
 
 /* ----------------- Config & Types ----------------- */
 
@@ -458,714 +459,6 @@ func (db *LeaseDB) compactNow(grace time.Duration) int {
 		_ = db.Save()
 	}
 	return n
-}
-
-/* ----------------- Console ----------------- */
-
-// ConsoleUI represents the interactive console UI using tview.
-type ConsoleUI struct {
-	app                 *tview.Application
-	logView             *tview.TextView
-	inputField          *tview.InputField
-	topSep              *tview.TextView
-	bottomSep           *tview.TextView
-	statusText          *tview.TextView
-	bottomBox           *tview.Flex
-	root                tview.Primitive // root layout to restore after modal
-	modal               tview.Primitive // currently open modal (if any)
-	prevFocus           tview.Primitive // previous focused primitive before opening modal
-	reqTimes            []time.Time
-	ackTimes            []time.Time
-	mu                  sync.Mutex
-	lines               []string // ring buffer content
-	maxLines            int      // buffer cap
-	filter              string
-	filterActive        bool
-	filterCaseSensitive bool
-	paused              bool
-	nocolour            bool
-	mouseOn             bool
-}
-
-// NewConsoleUI builds the interactive console using tview.
-func NewConsoleUI(nocolour bool, maxLines int) *ConsoleUI {
-	if maxLines <= 0 {
-		maxLines = 10000
-	}
-	app := tview.NewApplication()
-	ui := &ConsoleUI{
-		app:      app,
-		nocolour: nocolour,
-		maxLines: maxLines,
-		mouseOn:  true, // start with mouse ON by default
-	}
-
-	// Main log view
-	logView := tview.NewTextView().
-		SetDynamicColors(!nocolour).
-		SetScrollable(true).
-		SetWrap(false)
-	ui.logView = logView
-
-	// Separators (top/bottom lines around the log view)
-	ui.topSep = tview.NewTextView().SetWrap(false)
-	ui.bottomSep = tview.NewTextView().SetWrap(false)
-
-	// Input field (single line)
-	input := tview.NewInputField().
-		SetLabel("> ").
-		SetFieldWidth(0)
-	ui.inputField = input
-
-	// Status line under the input (shows help + RPM/APM + toggles)
-	status := tview.NewTextView().
-		SetWrap(false).
-		SetDynamicColors(!nocolour)
-	ui.statusText = status
-
-	// Bottom container: input (focusable) + status (non-focusable)
-	bottom := tview.NewFlex().
-		SetDirection(tview.FlexRow).
-		AddItem(input, 1, 0, true).
-		AddItem(status, 1, 0, false)
-	ui.bottomBox = bottom
-
-	// Root layout: top sep, log, bottom sep, then bottom box
-	root := tview.NewFlex().
-		SetDirection(tview.FlexRow).
-		AddItem(ui.topSep, 1, 0, false).
-		AddItem(logView, 0, 1, false).
-		AddItem(ui.bottomSep, 1, 0, false).
-		AddItem(bottom, 2, 0, true)
-	ui.root = root // <— IMPORTANT: remember root so modals can restore it
-
-	// Key bindings
-	ui.bindKeys()
-
-	// Initial focus: input line active
-	ui.app.EnableMouse(true) // reflect default mouseOn=true
-	ui.app.SetRoot(root, true)
-	ui.app.SetFocus(input)
-
-	// Initial separators and status bar
-	ui.setLogSeparators(false) // input has focus
-	ui.updateBottomBarDirect()
-
-	return ui
-}
-
-// Do schedules a UI update on tview's UI goroutine.
-func (ui *ConsoleUI) Do(fn func()) { ui.app.QueueUpdateDraw(fn) }
-
-// Input-line keys are handled via the input field callbacks.
-// bindKeys wires global and input-specific key handling.
-func (ui *ConsoleUI) bindKeys() {
-	// Live filter update while typing — only when filter is active.
-	ui.inputField.SetChangedFunc(func(text string) {
-		ui.mu.Lock()
-		active := ui.filterActive
-		if active {
-			ui.filter = text
-		}
-		ui.mu.Unlock()
-		if active {
-			ui.refreshDirect() // repaint with current filter
-		}
-	})
-
-	// Input behaviors — runs on tview's UI goroutine
-	ui.inputField.SetDoneFunc(func(key tcell.Key) {
-		switch key {
-		case tcell.KeyEnter:
-			// Toggle filter state; DO NOT clear the text when disabling
-			ui.mu.Lock()
-			txt := ui.inputField.GetText()
-			if ui.filterActive {
-				ui.filterActive = false
-				// keep ui.filter and input text intact so user can re-enable quickly
-			} else {
-				ui.filterActive = true
-				ui.filter = txt
-			}
-			ui.mu.Unlock()
-			ui.refreshDirect()
-
-		case tcell.KeyEsc:
-			ui.mu.Lock()
-			ui.filterActive = false
-			ui.filter = ""
-			ui.inputField.SetText("") // explicit clear via Esc
-			ui.mu.Unlock()
-			ui.refreshDirect()
-		}
-	})
-
-	// Helper: stop UI and exit process (works on all OSes)
-	exitNow := func(code int) {
-		ui.app.EnableMouse(false)
-		ui.app.Stop()
-		go func() {
-			time.Sleep(25 * time.Millisecond)
-			os.Exit(code)
-		}()
-	}
-
-	// Global keymap — runs on the UI goroutine
-	ui.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		switch ev.Key() {
-		case tcell.KeyTab: // cycle focus: log <-> input
-			if ui.app.GetFocus() == ui.logView {
-				ui.app.SetFocus(ui.inputField)
-				ui.setLogSeparators(false)
-			} else {
-				ui.app.SetFocus(ui.logView)
-				ui.setLogSeparators(true)
-			}
-			return nil
-
-		case tcell.KeyBacktab: // Shift+Tab reverse
-			if ui.app.GetFocus() == ui.inputField {
-				ui.app.SetFocus(ui.logView)
-				ui.setLogSeparators(true)
-			} else {
-				ui.app.SetFocus(ui.inputField)
-				ui.setLogSeparators(false)
-			}
-			return nil
-
-		case tcell.KeyCtrlC:
-			// ALWAYS exit (regardless of focus)
-			exitNow(130)
-			return nil
-
-		case tcell.KeyRune:
-			switch ev.Rune() {
-			case 'q', 'Q':
-				// Exit only when NOT typing in the input field
-				if ui.app.GetFocus() != ui.inputField {
-					exitNow(0)
-					return nil
-				}
-				return ev // allow typing q/Q in input
-
-			case 'm':
-				if ui.app.GetFocus() == ui.logView {
-					ui.mu.Lock()
-					ui.mouseOn = !ui.mouseOn
-					on := ui.mouseOn
-					ui.mu.Unlock()
-					ui.app.EnableMouse(on)
-					ui.updateBottomBarDirect() // immediately reflect green/yellow
-					return nil
-				}
-			case '?':
-				if ui.app.GetFocus() == ui.logView {
-					ui.showHelpModal()
-					return nil
-				}
-			case ' ':
-				// Pause/resume only when NOT in the input field
-				if ui.app.GetFocus() != ui.inputField {
-					ui.mu.Lock()
-					ui.paused = !ui.paused
-					ui.mu.Unlock()
-					ui.updateBottomBarDirect()
-					return nil
-				}
-			case 'c':
-				// Toggle case only when NOT in the input field (so 'c' can be typed in the filter)
-				if ui.app.GetFocus() != ui.inputField {
-					ui.mu.Lock()
-					ui.filterCaseSensitive = !ui.filterCaseSensitive
-					ui.mu.Unlock()
-					ui.refreshDirect()
-					return nil
-				}
-			}
-		case tcell.KeyUp:
-			if ui.app.GetFocus() == ui.logView {
-				row, col := ui.logView.GetScrollOffset()
-				if row > 0 {
-					ui.logView.ScrollTo(row-1, col)
-				}
-				return nil
-			}
-		case tcell.KeyDown:
-			if ui.app.GetFocus() == ui.logView {
-				row, col := ui.logView.GetScrollOffset()
-				ui.logView.ScrollTo(row+1, col)
-				return nil
-			}
-		case tcell.KeyPgUp:
-			if ui.app.GetFocus() == ui.logView {
-				_, _, _, h := ui.logView.GetInnerRect()
-				if h < 1 {
-					h = 1
-				}
-				row, col := ui.logView.GetScrollOffset()
-				nr := row - (h - 1)
-				if nr < 0 {
-					nr = 0
-				}
-				ui.logView.ScrollTo(nr, col)
-				return nil
-			}
-		case tcell.KeyPgDn:
-			if ui.app.GetFocus() == ui.logView {
-				_, _, _, h := ui.logView.GetInnerRect()
-				if h < 1 {
-					h = 1
-				}
-				row, col := ui.logView.GetScrollOffset()
-				ui.logView.ScrollTo(row+(h-1), col)
-				return nil
-			}
-		case tcell.KeyHome:
-			if ui.app.GetFocus() == ui.logView {
-				ui.logView.ScrollToBeginning()
-				return nil
-			}
-		case tcell.KeyEnd:
-			if ui.app.GetFocus() == ui.logView {
-				ui.logView.ScrollToEnd()
-				return nil
-			}
-		}
-		return ev
-	})
-}
-
-// helpText returns the formatted, sectioned help used by the modal
-func (ui *ConsoleUI) helpText() string {
-	key := func(s string) string {
-		if ui.nocolour {
-			return s
-		}
-		return "[blue::b]" + s + "[-:-:-]"
-	}
-	sec := func(s string) string {
-		if ui.nocolour {
-			return s
-		}
-		return "[::b]" + s + "[-:-:-]"
-	}
-
-	return strings.Join([]string{
-		sec("DHCPlane Console — Shortcuts & Help"),
-		"",
-		sec("Focus & Quit"),
-		"  " + key("Tab") + " / " + key("Shift+Tab") + "  Switch focus (Log ↔ Input)",
-		"  " + key("Ctrl+C") + "               Quit immediately",
-		"  " + key("q") + " (log focus)       Quit",
-		"",
-		sec("Log View (when focused)"),
-		"  " + key("Up/Down") + "              Scroll one line",
-		"  " + key("PgUp/PgDn") + "            Scroll one page",
-		"  " + key("Home/End") + "             Jump to top/bottom",
-		"  " + key("Space") + "                Pause/Resume autoscroll",
-		"  " + key("c") + "                    Toggle case sensitivity for filter",
-		"  " + key("m") + "                    Toggle mouse support",
-		"  " + key("?") + "                    Toggle this help",
-		"",
-		sec("Filter (Input line)"),
-		"  Type any text to set the filter pattern",
-		"  " + key("Enter") + "                 Enable/Disable filter (keeps text)",
-		"  " + key("Esc") + "                   Clear & disable filter",
-		"",
-		sec("Status Bar"),
-		"  Shows " + key("RPM") + " (REQUESTS/min), " + key("APM") + " (ACKS/min), and toggles:",
-		"   • Filter, Case Sensitive, Mouse, Running",
-		"",
-		sec("Notes"),
-		"  Colour tags appear only in console; the log file remains plain.",
-	}, "\n")
-}
-
-// showHelpModal builds and displays the help modal, remembering focus.
-func (ui *ConsoleUI) showHelpModal() {
-	// Remember current focus so we can restore exactly.
-	ui.prevFocus = ui.app.GetFocus()
-
-	// Use the rich help text.
-	help := ui.helpText()
-
-	m := tview.NewModal().
-		SetText(help).
-		AddButtons([]string{"Close"}).
-		SetDoneFunc(func(_ int, _ string) {
-			ui.closeModal()
-		})
-
-	// While the modal is up, swallow keys except close keys (handled in SetDoneFunc / your input capture).
-	ui.modal = m
-	ui.app.SetRoot(m, true)
-	ui.app.SetFocus(m)
-}
-
-// closeModal closes the help modal and restores the full UI and previous focus.
-func (ui *ConsoleUI) closeModal() {
-	if ui.modal == nil {
-		return
-	}
-	ui.modal = nil
-	// Restore the full UI and the exact widget that had focus.
-	ui.app.SetRoot(ui.root, true)
-	if ui.prevFocus != nil {
-		ui.app.SetFocus(ui.prevFocus)
-		// Update separators according to the real focused widget.
-		ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
-	}
-}
-
-// visualLen returns an approximate printable length by stripping simple tview [tag] blocks.
-func visualLen(s string) int {
-	inTag := false
-	n := 0
-	for _, r := range s {
-		switch r {
-		case '[':
-			inTag = true
-		case ']':
-			if inTag {
-				inTag = false
-			} else {
-				n++ // stray ']' counts
-			}
-		default:
-			if !inTag {
-				n++
-			}
-		}
-	}
-	return n
-}
-
-// refreshDirect repaints the log view directly.
-// Call this ONLY from the UI goroutine (e.g., inside widget callbacks).
-func (ui *ConsoleUI) refreshDirect() {
-	ui.logView.Clear()
-	for _, l := range ui.filteredLines() {
-		fmt.Fprintln(ui.logView, l)
-	}
-	// Keep separators width/form when we repaint
-	ui.setLogSeparators(ui.app.GetFocus() == ui.logView)
-	// Bottom bar may need an update (e.g., case toggle)
-	ui.updateBottomBarDirect()
-}
-
-// Start starts the console UI.
-func (ui *ConsoleUI) Start() {
-	go func() {
-		if err := ui.app.Run(); err != nil {
-			log.Fatalf("console UI failed: %v", err)
-		}
-	}()
-}
-
-// Stop stops the console UI.
-func (ui *ConsoleUI) Stop() {
-	ui.app.EnableMouse(false)
-	ui.app.Stop()
-}
-
-// setLogSeparators draws single ('─') or double ('═') lines to simulate top/bottom borders.
-func (ui *ConsoleUI) setLogSeparators(focused bool) {
-	// Be nil-safe: if these aren't ready yet, just return.
-	if ui.logView == nil || ui.topSep == nil || ui.bottomSep == nil {
-		return
-	}
-
-	// Use the log view width; GetScreen() isn't available on recent tview.
-	_, _, w, _ := ui.logView.GetInnerRect()
-	if w <= 0 {
-		w = 1
-	}
-
-	ch := '─'
-	if focused {
-		ch = '═'
-	}
-	line := strings.Repeat(string(ch), w)
-
-	ui.topSep.SetText(line)
-	ui.bottomSep.SetText(line)
-}
-
-// updateBottomBarDirect updates the 2nd line under the input with help + live RPM/APM.
-func (ui *ConsoleUI) updateBottomBarDirect() {
-	ui.mu.Lock()
-	rpm := len(ui.reqTimes)
-	apm := len(ui.ackTimes)
-	mouseOn := ui.mouseOn
-	filterOn := ui.filterActive
-	caseOn := ui.filterCaseSensitive
-	paused := ui.paused
-	nc := ui.nocolour
-	ui.mu.Unlock()
-
-	// Left segment (keys), with blue for keys
-	key := func(s string) string {
-		if nc {
-			return s
-		}
-		return "[blue::b]" + s + "[-:-:-]"
-	}
-	left := fmt.Sprintf("%s help | %s switch focus | %s quit | RPM: %d | APM: %d",
-		key("?"), key("Tab"), key("Ctrl+C"), rpm, apm)
-
-	// Right segment (statuses): green when "active", yellow when not
-	col := func(active bool, label string) string {
-		if nc {
-			return label
-		}
-		if active {
-			return "[green::b]" + label + "[-:-:-]"
-		}
-		return "[yellow]" + label + "[-:-:-]"
-	}
-	// Running is "active" when not paused
-	right := fmt.Sprintf("%s | %s | %s | %s",
-		col(filterOn, "Filter"),
-		col(caseOn, "Case Sensitive"),
-		col(!mouseOn, "Mouse"),
-		col(!paused, "Running"),
-	)
-
-	// Align right: pad spaces between left and right to fit width
-	_, _, w, _ := ui.statusText.GetInnerRect()
-	if w <= 0 {
-		// Fallback: just concatenate
-		ui.statusText.SetText(left + "  " + right)
-		return
-	}
-	pad := w - visualLen(left) - visualLen(right)
-	if pad < 1 {
-		pad = 1
-	}
-	ui.statusText.SetText(left + strings.Repeat(" ", pad) + right)
-}
-
-// Append appends one line, respecting pause and autoscroll, with bounded ring buffer.
-func (ui *ConsoleUI) Append(line string) {
-	now := time.Now()
-
-	// Track rates (REQUESTS per minute, ACKS per minute) from incoming lines
-	isReq := strings.Contains(line, "REQUEST")
-	isAck := strings.Contains(line, "ACK")
-	ui.mu.Lock()
-	ui.lines = append(ui.lines, line)
-	if len(ui.lines) > ui.maxLines {
-		excess := len(ui.lines) - ui.maxLines
-		ui.lines = ui.lines[excess:]
-	}
-	// Sliding 60s windows
-	cut := now.Add(-60 * time.Second)
-	if isReq {
-		ui.reqTimes = append(ui.reqTimes, now)
-	}
-	if isAck {
-		ui.ackTimes = append(ui.ackTimes, now)
-	}
-	// prune
-	i := 0
-	for _, t := range ui.reqTimes {
-		if t.After(cut) {
-			break
-		}
-		i++
-	}
-	if i > 0 && i <= len(ui.reqTimes) {
-		ui.reqTimes = ui.reqTimes[i:]
-	}
-	j := 0
-	for _, t := range ui.ackTimes {
-		if t.After(cut) {
-			break
-		}
-		j++
-	}
-	if j > 0 && j <= len(ui.ackTimes) {
-		ui.ackTimes = ui.ackTimes[j:]
-	}
-	paused := ui.paused
-	ui.mu.Unlock()
-
-	// Update UI
-	ui.Do(func() {
-		if !paused {
-			atBottom := ui.atBottom()
-			ui.logView.Clear()
-			for _, l := range ui.filteredLines() {
-				fmt.Fprintln(ui.logView, l)
-			}
-			if atBottom {
-				ui.logView.ScrollToEnd()
-			}
-		}
-		ui.updateBottomBarDirect()
-	})
-}
-
-func (ui *ConsoleUI) filteredLines() []string {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-
-	flt := ui.filter
-	active := ui.filterActive
-	caseSens := ui.filterCaseSensitive
-
-	if !active || strings.TrimSpace(flt) == "" {
-		out := make([]string, len(ui.lines))
-		copy(out, ui.lines)
-		return out
-	}
-
-	out := make([]string, 0, len(ui.lines))
-	if caseSens {
-		for _, l := range ui.lines {
-			if strings.Contains(l, flt) {
-				out = append(out, l)
-			}
-		}
-	} else {
-		want := strings.ToLower(flt)
-		for _, l := range ui.lines {
-			if strings.Contains(strings.ToLower(l), want) {
-				out = append(out, l)
-			}
-		}
-	}
-	return out
-}
-
-func (ui *ConsoleUI) atBottom() bool {
-	// Must be called on UI thread via ui.Do.
-	filtered := ui.filteredLines()
-	total := len(filtered)
-	row, _ := ui.logView.GetScrollOffset()
-	_, _, _, h := ui.logView.GetInnerRect()
-	if h <= 0 {
-		h = 1
-	}
-	if total == 0 {
-		return true
-	}
-	threshold := total - h
-	if threshold < 0 {
-		threshold = 0
-	}
-	return row >= threshold
-}
-
-/* ----------------- Config parsing & validation ----------------- */
-
-type jsonErr struct {
-	Err    error
-	Line   int
-	Column int
-}
-
-func (e *jsonErr) Error() string {
-	if e.Line > 0 {
-		return fmt.Sprintf("%v (line %d, column %d)", e.Err, e.Line, e.Column)
-	}
-	return e.Err.Error()
-}
-
-/* ----------------- Small helpers ----------------- */
-
-func errf(format string, a ...any) error {
-	msg := fmt.Sprintf(format, a...)
-	// File logger stays clean. This helper is only for immediate stderr prints.
-	// Use aurora for colour; respect the user’s preference elsewhere if needed.
-	fmt.Fprintln(os.Stderr, aurora.Red(fmt.Sprintf("ERROR: %s", msg)))
-	return errors.New(msg)
-}
-
-func warnf(format string, a ...any) {
-	msg := fmt.Sprintf(format, a...)
-	// Immediate stderr warning with aurora; file logs remain clean.
-	fmt.Fprintln(os.Stderr, aurora.Yellow(fmt.Sprintf("WARNING: %s", msg)))
-}
-
-// Accepts with ":" "-" or no separators (12 hex chars)
-func normalizeMACFlexible(s string) (string, error) {
-	s = strings.TrimSpace(strings.ToLower(s))
-	// remove separators
-	raw := strings.Map(func(r rune) rune {
-		switch {
-		case r >= '0' && r <= '9':
-			return r
-		case r >= 'a' && r <= 'f':
-			return r
-		default:
-			return -1
-		}
-	}, s)
-	if len(raw) == 12 {
-		var parts []string
-		for i := 0; i < 12; i += 2 {
-			parts = append(parts, raw[i:i+2])
-		}
-		s = strings.Join(parts, ":")
-	} else {
-		// keep original (maybe already colon/dash separated)
-		s = strings.ReplaceAll(s, "-", ":")
-	}
-	m, err := net.ParseMAC(s)
-	if err != nil {
-		return "", err
-	}
-	return strings.ToLower(m.String()), nil
-}
-
-func mustCIDR(c string) (net.IP, *net.IPNet) {
-	ip, n, err := net.ParseCIDR(c)
-	if err != nil {
-		log.Fatalf("bad subnet_cidr %q: %v", c, err)
-	}
-	return ip, n
-}
-
-func parseIP4(s string) net.IP {
-	ip := net.ParseIP(strings.TrimSpace(s)).To4()
-	if ip == nil {
-		log.Fatalf("bad IPv4 %q", s)
-	}
-	return ip
-}
-
-func toIPs(list []string) []net.IP {
-	out := make([]net.IP, 0, len(list))
-	for _, s := range list {
-		ip := net.ParseIP(strings.TrimSpace(s)).To4()
-		if ip != nil {
-			out = append(out, ip)
-		}
-	}
-	return out
-}
-
-func ipToU32(ip net.IP) uint32 { return binary.BigEndian.Uint32(ip.To4()) }
-
-func u32ToIP(v uint32) net.IP {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return net.IP(b)
-}
-
-func incIP(ip net.IP) net.IP { return u32ToIP(ipToU32(ip) + 1) }
-
-func ipInSubnet(ip net.IP, n *net.IPNet) bool { return n.Contains(ip) }
-
-func broadcastAddr(n *net.IPNet) net.IP {
-	ip := n.IP.To4()
-	mask := net.IP(n.Mask).To4()
-	var b [4]byte
-	for i := 0; i < 4; i++ {
-		b[i] = ip[i] | ^mask[i]
-	}
-	return net.IP(b[:])
 }
 
 /* ----------------- Logging ----------------- */
@@ -2105,8 +1398,8 @@ func main() {
 	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path (empty to log only to console)")
 	root.PersistentFlags().BoolVar(&console, "console", false, "Also print logs to stdout in addition to --log")
 	root.PersistentFlags().StringVar(&pidPath, "pid-file", "dhcplane.pid", "PID file for reload control")
-	// NEW: global flag to disable console colours
 	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
+	root.PersistentFlags().BoolVar(&transparent, "transparent", false, "Use terminal background (no solid fill)")
 
 	/* ---- serve ---- */
 	serveCmd := &cobra.Command{
@@ -2116,6 +1409,12 @@ func main() {
 			// Validate config before start
 			if _, jerr := config.ParseStrict(cfgPath); jerr != nil {
 				return fmt.Errorf("config error: %w", jerr)
+			}
+
+			if transparent {
+				tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
+				tview.Styles.ContrastBackgroundColor = tcell.ColorDefault
+				tview.Styles.MoreContrastBackgroundColor = tcell.ColorDefault
 			}
 			return buildServerAndRun(cfgPath, leasePath, authoritative, logPath, console, pidPath, nocolour)
 		},
@@ -2480,4 +1779,103 @@ func macEqual(a, b string) bool {
 	}
 	// Fallback: case-insensitive direct compare if one side failed normalization.
 	return strings.EqualFold(a, b)
+}
+
+/* ----------------- Small helpers ----------------- */
+
+func errf(format string, a ...any) error {
+	msg := fmt.Sprintf(format, a...)
+	// File logger stays clean. This helper is only for immediate stderr prints.
+	// Use aurora for colour; respect the user’s preference elsewhere if needed.
+	fmt.Fprintln(os.Stderr, aurora.Red(fmt.Sprintf("ERROR: %s", msg)))
+	return errors.New(msg)
+}
+
+func warnf(format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	// Immediate stderr warning with aurora; file logs remain clean.
+	fmt.Fprintln(os.Stderr, aurora.Yellow(fmt.Sprintf("WARNING: %s", msg)))
+}
+
+// Accepts with ":" "-" or no separators (12 hex chars)
+func normalizeMACFlexible(s string) (string, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	// remove separators
+	raw := strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9':
+			return r
+		case r >= 'a' && r <= 'f':
+			return r
+		default:
+			return -1
+		}
+	}, s)
+	if len(raw) == 12 {
+		var parts []string
+		for i := 0; i < 12; i += 2 {
+			parts = append(parts, raw[i:i+2])
+		}
+		s = strings.Join(parts, ":")
+	} else {
+		// keep original (maybe already colon/dash separated)
+		s = strings.ReplaceAll(s, "-", ":")
+	}
+	m, err := net.ParseMAC(s)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(m.String()), nil
+}
+
+func mustCIDR(c string) (net.IP, *net.IPNet) {
+	ip, n, err := net.ParseCIDR(c)
+	if err != nil {
+		log.Fatalf("bad subnet_cidr %q: %v", c, err)
+	}
+	return ip, n
+}
+
+func parseIP4(s string) net.IP {
+	ip := net.ParseIP(strings.TrimSpace(s)).To4()
+	if ip == nil {
+		log.Fatalf("bad IPv4 %q", s)
+	}
+	return ip
+}
+
+func toIPs(list []string) []net.IP {
+	out := make([]string, 0, len(list))
+	ips := make([]net.IP, 0, len(list))
+	for _, s := range list {
+		ip := net.ParseIP(strings.TrimSpace(s)).To4()
+		if ip != nil {
+			ips = append(ips, ip)
+			out = append(out, ip.String())
+		}
+	}
+	_ = out // kept for clarity; only ips is returned
+	return ips
+}
+
+func ipToU32(ip net.IP) uint32 { return binary.BigEndian.Uint32(ip.To4()) }
+
+func u32ToIP(v uint32) net.IP {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, v)
+	return net.IP(b)
+}
+
+func incIP(ip net.IP) net.IP { return u32ToIP(ipToU32(ip) + 1) }
+
+func ipInSubnet(ip net.IP, n *net.IPNet) bool { return n.Contains(ip) }
+
+func broadcastAddr(n *net.IPNet) net.IP {
+	ip := n.IP.To4()
+	mask := net.IP(n.Mask).To4()
+	var b [4]byte
+	for i := 0; i < 4; i++ {
+		b[i] = ip[i] | ^mask[i]
+	}
+	return net.IP(b[:])
 }
