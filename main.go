@@ -484,6 +484,9 @@ func main() {
 		Use:   "serve",
 		Short: "Start the DHCP server",
 		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := ensureDefaultConfig(cfgPath); err != nil {
+				return fmt.Errorf("default config: %w", err)
+			}
 			// Validate config before start
 			if _, jerr := config.ParseStrict(cfgPath); jerr != nil {
 				return fmt.Errorf("config error: %w", jerr)
@@ -843,6 +846,55 @@ func macEqual(a, b string) bool {
 		return na == nb
 	}
 	return strings.EqualFold(a, b)
+}
+
+// ensureDefaultConfig writes a sane default config if cfgPath does not exist.
+func ensureDefaultConfig(cfgPath string) error {
+	_, err := os.Stat(cfgPath)
+	if err == nil {
+		return nil // exists
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	// Default: 192.168.1.0/24
+	def := map[string]any{
+		"interface":              "",
+		"server_ip":              "192.168.1.2",
+		"subnet_cidr":            "192.168.1.0/24",
+		"gateway":                "192.168.1.1",
+		"compact_on_load":        false,
+		"dns":                    []string{"192.168.1.1", "1.1.1.1"},
+		"domain":                 "lan",
+		"lease_seconds":          3600,
+		"lease_sticky_seconds":   3600,
+		"auto_reload":            true,
+		"pools":                  []map[string]string{{"start": "192.168.1.100", "end": "192.168.1.200"}},
+		"exclusions":             []string{"192.168.1.1", "192.168.1.2"},
+		"reservations":           map[string]any{},
+		"ntp":                    []string{},
+		"mtu":                    0,
+		"tftp_server_name":       "",
+		"bootfile_name":          "",
+		"wpad_url":               "",
+		"wins":                   []string{},
+		"domain_search":          []string{},
+		"static_routes":          []map[string]string{},
+		"mirror_routes_to_249":   false,
+		"vendor_specific_43_hex": "",
+		"device_overrides":       map[string]any{},
+		"banned_macs":            map[string]any{},
+		"equipment_types":        []string{},
+		"management_types":       []string{},
+		"console_max_lines":      10000,
+	}
+
+	b, _ := json.MarshalIndent(def, "", "  ")
+	return os.WriteFile(cfgPath, b, 0o644)
 }
 
 /* ----------------- Local type needed for bind closer ----------------- */
