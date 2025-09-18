@@ -197,7 +197,7 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 
 	// Bind + Serve, with rebind support when Interface changes
 	laddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 67}
-	var closer ioCloser = nil
+	var closer ioCloser
 	var currentIface = cfg.Interface
 
 	bind := func(newIface string) error {
@@ -469,8 +469,8 @@ func main() {
 			return nil
 		},
 	}
-	root.PersistentFlags().BoolVarP(&showVersion, "version", "v", false, "Print version and exit")
-	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.json", "Path to JSON config")
+	root.PersistentFlags().BoolVarP(&showVersion, "version", "", false, "Print version and exit")
+	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.config", "Path to JSON config")
 	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
 	root.PersistentFlags().BoolVar(&authoritative, "authoritative", true, "Send NAKs on invalid requests")
 	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path (empty to log only to console)")
