@@ -9,6 +9,7 @@ require (
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/rivo/tview v0.42.0
 	github.com/spf13/cobra v1.10.1
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

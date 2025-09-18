@@ -7,6 +7,7 @@ import (
 	"dhcplane/statistics"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var appVersion = "0.1.37"
@@ -55,20 +57,56 @@ func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
 
 /* ----------------- Logging ----------------- */
 
-func setupLogger(path string) (*log.Logger, *os.File, error) {
-	if path == "" {
-		lg := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
-		return lg, nil, nil
+func setupLogger(flagPath string, cfg config.Config) (*log.Logger, io.Closer, error) {
+	// Config-driven rotating file if logging is specified in config.
+	if cfg.Logging.Path != "" || cfg.Logging.Filename != "" {
+		full := cfg.Logging.Filename
+		if cfg.Logging.Path != "" {
+			full = filepath.Join(cfg.Logging.Path, cfg.Logging.Filename)
+		}
+		if full == "" {
+			return nil, nil, fmt.Errorf("logging.filename is required when logging.path is set")
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil && !os.IsExist(err) {
+			return nil, nil, err
+		}
+		rot := &lumberjack.Logger{
+			Filename: full,
+			MaxSize: func() int {
+				if cfg.Logging.MaxSize > 0 {
+					return cfg.Logging.MaxSize
+				}
+				return 20
+			}(),
+			MaxBackups: func() int {
+				if cfg.Logging.MaxBackups > 0 {
+					return cfg.Logging.MaxBackups
+				}
+				return 5
+			}(),
+			MaxAge:   cfg.Logging.MaxAge, // 0 means no age-based pruning
+			Compress: true,               // gzip; lumberjack doesn't support zstd
+		}
+		lg := log.New(rot, "", log.LstdFlags|log.Lmicroseconds)
+		return lg, rot, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && !os.IsExist(err) {
+
+	// No logging section: keep old default path and rotate with defaults.
+	if flagPath == "" {
+		flagPath = "dhcplane.log"
+	}
+	if err := os.MkdirAll(filepath.Dir(flagPath), 0o755); err != nil && !os.IsExist(err) {
 		return nil, nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, nil, err
+	rot := &lumberjack.Logger{
+		Filename:   flagPath,
+		MaxSize:    20, // MB
+		MaxBackups: 5,
+		MaxAge:     0,
+		Compress:   true, // gzip
 	}
-	lg := log.New(f, "", log.LstdFlags|log.Lmicroseconds)
-	return lg, f, nil
+	lg := log.New(rot, "", log.LstdFlags|log.Lmicroseconds)
+	return lg, rot, nil
 }
 
 func writePID(pidPath string) error {
@@ -113,15 +151,14 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		log.Printf("lease db load: %v (continuing with empty)", err)
 	}
 
-	// Logger (file only)
-	lg, f, err := setupLogger(logPath)
+	// Logger (file or rotating)
+	lg, closer, err := setupLogger(logPath, cfg)
 	if err != nil {
 		return fmt.Errorf("logger: %w", err)
 	}
 	defer func() {
-		if f != nil {
-			_ = f.Sync()
-			_ = f.Close()
+		if closer != nil {
+			_ = closer.Close()
 		}
 	}()
 
@@ -197,19 +234,19 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 
 	// Bind + Serve, with rebind support when Interface changes
 	laddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 67}
-	var closer ioCloser
+	var closerUDP ioCloser
 	var currentIface = cfg.Interface
 
 	bind := func(newIface string) error {
-		if closer != nil {
-			_ = closer.Close()
-			closer = nil
+		if closerUDP != nil {
+			_ = closerUDP.Close()
+			closerUDP = nil
 		}
 		c, err := s.BindAndServe(newIface, laddr)
 		if err != nil {
 			return err
 		}
-		closer = c
+		closerUDP = c
 		currentIface = newIface
 		return nil
 	}
@@ -483,10 +520,13 @@ func main() {
 	serveCmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the DHCP server",
+		// serveCmd RunE (anonymous func) — with default config generation
 		RunE: func(_ *cobra.Command, _ []string) error {
+			// Create a default config if missing
 			if err := ensureDefaultConfig(cfgPath); err != nil {
 				return fmt.Errorf("default config: %w", err)
 			}
+
 			// Validate config before start
 			if _, jerr := config.ParseStrict(cfgPath); jerr != nil {
 				return fmt.Errorf("config error: %w", jerr)

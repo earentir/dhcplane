@@ -40,3 +40,4 @@ archive/
 tooling/
 dhcplane
 dhcplane.exe
+*.log.gz

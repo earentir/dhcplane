@@ -119,10 +119,24 @@ type Config struct {
 
 	//Max console buffer
 	ConsoleMaxLines int `json:"console_max_lines,omitempty"`
+
+	// Log rotation settings
+	Logging LoggingConfig `json:"logging"`
+}
+
+// LoggingConfig represents log rotation settings.
+type LoggingConfig struct {
+	Path       string `json:"path,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	MaxSize    int    `json:"max_size,omitempty"` // megabytes
+	MaxBackups int    `json:"max_backups,omitempty"`
+	MaxAge     int    `json:"max_age,omitempty"` // days
+	Compress   bool   `json:"compress,omitempty"`
 }
 
 /* ----------------- Config parsing & validation ----------------- */
 
+// JSONErr represents a JSON parsing error with line/column info.
 type JSONErr struct {
 	Err    error
 	Line   int
@@ -238,7 +252,7 @@ func stringInSlice(s string, list []string) bool {
 	return false
 }
 
-// parseHexPayload: accepts "01 02", "0x01,0x02", "hex:01:02", etc.
+// ParseHexPayload accepts "01 02", "0x01,0x02", "hex:01:02", etc.
 func ParseHexPayload(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "hex:")
@@ -253,14 +267,13 @@ func ParseHexPayload(s string) ([]byte, error) {
 	return hex.DecodeString(s)
 }
 
-// validateAndNormalizeConfig applies defaults, normalizes MAC-keyed maps,
+// ValidateAndNormalizeConfig applies defaults, normalizes MAC-keyed maps,
 // validates option 43, and returns any warnings to log.
 // It returns a COPY of cfg with fixes applied.
 func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
-	c := cfg // copy
+	c := cfg
 	var warns []string
 
-	// 1) Defaults for enum lists (match old behavior)
 	if len(c.EquipmentTypes) == 0 {
 		c.EquipmentTypes = []string{"Switch", "Router", "AP", "Modem", "Gateway"}
 	}
@@ -268,7 +281,6 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		c.ManagementTypes = []string{"ssh", "web", "telnet", "serial", "console"}
 	}
 
-	// 2) Normalize Reservations map keys and warn on unknown enums (same texts)
 	if c.Reservations == nil {
 		c.Reservations = make(Reservations)
 	} else {
@@ -278,18 +290,14 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 			if err != nil {
 				return cfg, warns, fmt.Errorf("bad reservation MAC %q: %w", m, err)
 			}
-			// enum validation warnings (same logic/messages as before)
 			if rv.EquipmentType != "" && !stringInSlice(rv.EquipmentType, c.EquipmentTypes) {
-				warns = append(warns, fmt.Sprintf(
-					"warning: reservation %s has unknown equipment_type %q; allowed: %v",
+				warns = append(warns, fmt.Sprintf("warning: reservation %s has unknown equipment_type %q; allowed: %v",
 					nm, rv.EquipmentType, c.EquipmentTypes))
 			}
 			if rv.ManagementType != "" && !stringInSlice(rv.ManagementType, c.ManagementTypes) {
-				warns = append(warns, fmt.Sprintf(
-					"warning: reservation %s has unknown management_type %q; allowed: %v",
+				warns = append(warns, fmt.Sprintf("warning: reservation %s has unknown management_type %q; allowed: %v",
 					nm, rv.ManagementType, c.ManagementTypes))
 			}
-			// normalize stored IP as well (parse to v4 then back to string)
 			ip := parseIPv4(rv.IP)
 			if ip == nil {
 				return cfg, warns, fmt.Errorf("bad reservation IP %q", rv.IP)
@@ -300,7 +308,6 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		c.Reservations = norm
 	}
 
-	// 3) Normalize DeviceOverrides MAC keys
 	if c.DeviceOverrides == nil {
 		c.DeviceOverrides = make(map[string]DeviceOverride)
 	} else {
@@ -310,20 +317,17 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 			if err != nil {
 				return cfg, warns, fmt.Errorf("bad device_overrides MAC %q: %w", m, err)
 			}
-			// Later keys silently override earlier if they normalize to same MAC.
 			norm[nm] = ov
 		}
 		c.DeviceOverrides = norm
 	}
 
-	// 4) Validate VendorSpecific43Hex once (reject invalid configs)
 	if s := strings.TrimSpace(c.VendorSpecific43Hex); s != "" {
 		if _, err := ParseHexPayload(s); err != nil {
 			return cfg, warns, fmt.Errorf("vendor_specific_43_hex: %w", err)
 		}
 	}
 
-	// 5) Warnings for BannedMACs enum meta (same texts as before)
 	if c.BannedMACs == nil {
 		c.BannedMACs = make(map[string]DeviceMeta)
 	} else {
@@ -333,15 +337,33 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 				return cfg, warns, fmt.Errorf("bad banned_macs MAC %q: %w", m, err)
 			}
 			if meta.EquipmentType != "" && !stringInSlice(meta.EquipmentType, c.EquipmentTypes) {
-				warns = append(warns, fmt.Sprintf(
-					"warning: banned %s has unknown equipment_type %q; allowed: %v",
+				warns = append(warns, fmt.Sprintf("warning: banned %s has unknown equipment_type %q; allowed: %v",
 					nm, meta.EquipmentType, c.EquipmentTypes))
 			}
 			if meta.ManagementType != "" && !stringInSlice(meta.ManagementType, c.ManagementTypes) {
-				warns = append(warns, fmt.Sprintf(
-					"warning: banned %s has unknown management_type %q; allowed: %v",
+				warns = append(warns, fmt.Sprintf("warning: banned %s has unknown management_type %q; allowed: %v",
 					nm, meta.ManagementType, c.ManagementTypes))
 			}
+		}
+	}
+
+	// Logging defaults and validation (applies when logging is present)
+	if c.Logging.Path != "" || c.Logging.Filename != "" {
+		if c.Logging.MaxSize <= 0 {
+			c.Logging.MaxSize = 20 // MB
+		}
+		if c.Logging.MaxBackups < 0 {
+			return cfg, warns, fmt.Errorf("logging.max_backups must be >= 0")
+		}
+		if c.Logging.MaxBackups == 0 {
+			c.Logging.MaxBackups = 5
+		}
+		if c.Logging.MaxAge < 0 {
+			return cfg, warns, fmt.Errorf("logging.max_age must be >= 0")
+		}
+		// Default to gzip compression when not specified
+		if !c.Logging.Compress {
+			c.Logging.Compress = true
 		}
 	}
 
