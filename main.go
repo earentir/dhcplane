@@ -51,6 +51,8 @@ func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
 	ui.HighlightMap("DISCOVER", true, consoleui.Style{FG: "yellow", Attrs: "b"})
 	ui.HighlightMap("RELEASE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
 	ui.HighlightMap("DECLINE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	ui.HighlightMap("DETECT", true, consoleui.Style{FG: "green", Attrs: "b"})
+	ui.HighlightMap("FOREIGN-DHCP", true, consoleui.Style{FG: "red", Attrs: "b"})
 
 	return ui
 }
@@ -133,6 +135,21 @@ func readPID(pidPath string) (int, error) {
 }
 
 /* ----------------- Server bootstrap ----------------- */
+
+// logDetect prints the detection mode line to logs and console via logSink.
+func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
+	if cfg.DetectDHCPServers.Enabled {
+		logSink("DETECT start mode=%s interval=%ds rate_limit=%d/min iface=%s whitelist=%d",
+			strings.ToLower(strings.TrimSpace(cfg.DetectDHCPServers.ActiveProbe)),
+			cfg.DetectDHCPServers.ProbeInterval,
+			cfg.DetectDHCPServers.RateLimit,
+			iface,
+			len(cfg.DetectDHCPServers.WhitelistServers),
+		)
+	} else {
+		logSink("DETECT disabled (config) iface=%s", iface)
+	}
+}
 
 func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, logPath string, console bool, pidPath string, nocolour bool) error {
 	// Load + validate/normalize initial config
@@ -261,6 +278,9 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		logSink("START auto_reload=true (watching %s)", cfgPath)
 	}
 
+	// DETECT announcement on startup
+	logDetect(&cfg, currentIface, logSink)
+
 	// Optional auto-reload watcher
 	var watcher *fsnotify.Watcher
 	var watcherErr error
@@ -284,6 +304,9 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				}
 			}
 			logSink("AUTO-RELOAD: config applied")
+
+			// DETECT announcement after auto-reload apply
+			logDetect(&newCfg, currentIface, logSink)
 		}, logSink)
 		if watcherErr != nil {
 			logSink("AUTO-RELOAD: watcher failed: %v", watcherErr)
@@ -361,6 +384,10 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				}
 			}
 			logSink("RELOAD: config applied")
+
+			// DETECT announcement after manual reload
+			logDetect(&newCfg, currentIface, logSink)
+
 		case syscall.SIGINT, syscall.SIGTERM:
 			logSink("SIGNAL received, shutting down")
 			_ = s.Close()
@@ -947,6 +974,14 @@ func ensureDefaultConfig(cfgPath string) error {
 			"max_backups": 5,
 			"max_age":     0,    // days; 0 = no age-based purge
 			"compress":    true, // gzip (lumberjack)
+		},
+		// New: default detection block
+		"detect_dhcp_servers": map[string]any{
+			"enabled":           true,
+			"active_probe":      "off",   // off|safe|aggressive
+			"probe_interval":    600,     // seconds
+			"rate_limit":        6,       // events per minute per server
+			"whitelist_servers": []any{}, // IPv4 or MAC entries
 		},
 	}
 

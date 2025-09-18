@@ -148,6 +148,17 @@ type Config struct {
 
 	// Log rotation settings
 	Logging LoggingConfig `json:"logging"`
+
+	DetectDHCPServers DHCPServerDetectionConfig `json:"detect_dhcp_servers,omitempty"`
+}
+
+// DHCPServerDetectionConfig holds settings for DHCP server detection.
+type DHCPServerDetectionConfig struct {
+	Enabled          bool     `json:"enabled,omitempty"`
+	ActiveProbe      string   `json:"active_probe,omitempty"`
+	ProbeInterval    int      `json:"probe_interval,omitempty"`
+	WhitelistServers []string `json:"whitelist_servers,omitempty"`
+	RateLimit        int      `json:"rate_limit,omitempty"`
 }
 
 // LoggingConfig represents log rotation settings.
@@ -436,6 +447,70 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		if !c.Logging.Compress {
 			c.Logging.Compress = true
 		}
+	}
+
+	// DetectDHCPServers: defaults, clamps, normalization, validation
+	{
+		d := c.DetectDHCPServers
+
+		// Defaults
+		if !d.Enabled {
+			// keep explicit false if user set it; otherwise default true
+			// We cannot distinguish explicit false via struct tags, so default to true only if all fields zeroed.
+			// Heuristic: if ActiveProbe/ProbeInterval/RateLimit all zero values and whitelist empty, assume unset and default Enabled=true.
+			if d.ActiveProbe == "" && d.ProbeInterval == 0 && d.RateLimit == 0 && len(d.WhitelistServers) == 0 {
+				d.Enabled = true
+			}
+		}
+		if d.ActiveProbe == "" {
+			d.ActiveProbe = "off"
+		}
+		d.ActiveProbe = strings.ToLower(strings.TrimSpace(d.ActiveProbe))
+		switch d.ActiveProbe {
+		case "off", "safe", "aggressive":
+			// ok
+		default:
+			warns = append(warns, fmt.Sprintf("warning: detect_dhcp_servers.active_probe %q not in {off,safe,aggressive}; using off", d.ActiveProbe))
+			d.ActiveProbe = "off"
+		}
+
+		if d.ProbeInterval <= 0 {
+			d.ProbeInterval = 600
+		}
+		if d.ProbeInterval < 60 {
+			warns = append(warns, "warning: detect_dhcp_servers.probe_interval clamped to 60s minimum")
+			d.ProbeInterval = 60
+		}
+
+		if d.RateLimit <= 0 {
+			d.RateLimit = 6
+		}
+		if d.RateLimit < 1 {
+			d.RateLimit = 1
+		}
+
+		// Normalize whitelist entries: accept IPv4s as-is, MACs normalized, drop invalids with warning
+		if len(d.WhitelistServers) > 0 {
+			out := make([]string, 0, len(d.WhitelistServers))
+			for _, w := range d.WhitelistServers {
+				w = strings.TrimSpace(w)
+				if w == "" {
+					continue
+				}
+				if ip := parseIPv4(w); ip != nil {
+					out = append(out, ip.String())
+					continue
+				}
+				if nm, err := normalizeMACFlexible(w); err == nil {
+					out = append(out, nm)
+					continue
+				}
+				warns = append(warns, fmt.Sprintf("warning: detect_dhcp_servers.whitelist_servers entry %q ignored (not IPv4 or MAC)", w))
+			}
+			d.WhitelistServers = out
+		}
+
+		c.DetectDHCPServers = d
 	}
 
 	return c, warns, nil
