@@ -32,33 +32,23 @@ import (
 var appVersion = "0.1.39"
 var transparent bool
 
-// buildConsoleUI wires the generic console with our DHCP-specific counters and highlights.
-func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
-	ui := consoleui.New(consoleui.Options{
-		NoColour:     nocolour,
-		MaxLines:     maxLines,
-		MouseEnabled: true,
-		OnExit:       nil,
-		Headless:     true,
-	})
-	ui.SetTitle(fmt.Sprintf("DHCPlane Console v%s", appVersion))
-
-	ui.RegisterCounter("REQUEST", false, "RPM", 60)
-	ui.RegisterCounter("ACK", false, "APM", 60)
-
-	ui.HighlightMap("BANNED-MAC", true, consoleui.Style{FG: "red", Attrs: "b"})
-	ui.HighlightMap("NAK", true, consoleui.Style{FG: "red", Attrs: "b"})
-	ui.HighlightMap("ACK", true, consoleui.Style{FG: "green", Attrs: "b"})
-	ui.HighlightMap("OFFER", true, consoleui.Style{FG: "green", Attrs: "b"})
-	ui.HighlightMap("REQUEST", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	ui.HighlightMap("DISCOVER", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	ui.HighlightMap("RELEASE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	ui.HighlightMap("DECLINE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	ui.HighlightMap("DETECT", true, consoleui.Style{FG: "green", Attrs: "b"})
-	ui.HighlightMap("FOREIGN-DHCP", true, consoleui.Style{FG: "red", Attrs: "b"})
-	ui.HighlightMap("ARP-ANOMALY", true, consoleui.Style{FG: "red", Attrs: "b"})
-
-	return ui
+// buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
+func buildConsoleBroker(maxLines int) *consoleui.Broker {
+	broker := consoleui.NewBroker(consoleui.BrokerOptions{MaxLines: maxLines})
+	broker.RegisterCounter("REQUEST", false, "RPM", 60)
+	broker.RegisterCounter("ACK", false, "APM", 60)
+	broker.HighlightMap("BANNED-MAC", true, consoleui.Style{FG: "red", Attrs: "b"})
+	broker.HighlightMap("NAK", true, consoleui.Style{FG: "red", Attrs: "b"})
+	broker.HighlightMap("ACK", true, consoleui.Style{FG: "green", Attrs: "b"})
+	broker.HighlightMap("OFFER", true, consoleui.Style{FG: "green", Attrs: "b"})
+	broker.HighlightMap("REQUEST", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	broker.HighlightMap("DISCOVER", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	broker.HighlightMap("RELEASE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	broker.HighlightMap("DECLINE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
+	broker.HighlightMap("DETECT", true, consoleui.Style{FG: "green", Attrs: "b"})
+	broker.HighlightMap("FOREIGN-DHCP", true, consoleui.Style{FG: "red", Attrs: "b"})
+	broker.HighlightMap("ARP-ANOMALY", true, consoleui.Style{FG: "red", Attrs: "b"})
+	return broker
 }
 
 /* ----------------- Logging ----------------- */
@@ -184,20 +174,18 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 		}
 	}()
 
-	// Optional console UI (now broker-backed; Start() serves the UNIX socket)
-	var ui *consoleui.UI
+	// Optional console broker (exports console over UNIX socket)
+	var broker *consoleui.Broker
 	if console {
 		maxLines := cfg.ConsoleMaxLines
 		if maxLines <= 0 {
 			maxLines = 10000
 		}
-		ui = buildConsoleUI(nocolour, maxLines)
-		go func() {
-			if err := ui.Start(); err != nil {
-				log.Fatalf("console UI failed: %v", err)
-			}
-		}()
-		defer ui.Stop()
+		broker = buildConsoleBroker(maxLines)
+		if err := broker.Start(); err != nil {
+			return fmt.Errorf("console broker: %w", err)
+		}
+		defer broker.Stop()
 	}
 
 	// Sinks
@@ -209,8 +197,8 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 
 		ts := time.Now().Format("2006/01/02 15:04:05.000000")
 
-		if ui != nil {
-			ui.Append(ts + " " + msg)
+		if broker != nil {
+			broker.Append(ts + " " + msg)
 		}
 
 		if stdoutLog {
@@ -223,8 +211,8 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 			lg.Printf("%s", msg)
 		}
 		ts := time.Now().Format("2006/01/02 15:04:05.000000")
-		if ui != nil {
-			ui.Append(ts + " " + msg)
+		if broker != nil {
+			broker.Append(ts + " " + msg)
 		}
 		if stdoutLog {
 			fmt.Fprintln(os.Stderr, msg)

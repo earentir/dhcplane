@@ -1,7 +1,5 @@
-// Package consoleui provides a generic, tview-based console with:
-//   - Local interactive UI (tview) when attaching as a client.
-//   - Headless broker inside the server process that exports the console over a UNIX socket.
-//     The server continues to call Append(...) as before; no other packages need changes.
+// Package consoleui provides a generic console toolkit with a headless server broker
+// and an interactive tview client used by `dhcplane console attach`.
 package consoleui
 
 import (
@@ -38,7 +36,6 @@ type Options struct {
 	HelpExtra     []string
 	OnExit        func(code int)
 	DisableTopBar bool // false = show top bar (Title | Counters); true = legacy: no top bar
-	Headless      bool
 }
 
 type counterRule struct {
@@ -91,16 +88,8 @@ type wireNotice struct {
 	Text string `json:"text"`
 }
 
-// brokerClient is a single attached viewer.
-type brokerClient struct {
-	conn net.Conn
-	bw   *bufio.Writer
-	ch   chan []byte // bounded queue (drop-oldest policy)
-}
-
-// UI represents the console UI.
+// UI represents the interactive client UI.
 type UI struct {
-	// visuals (used by the attach client; created in all cases for API stability)
 	app        *tview.Application
 	logView    *tview.TextView
 	inputField *tview.InputField
@@ -132,19 +121,6 @@ type UI struct {
 	counters   []*counterRule
 	hlMu       sync.Mutex
 	highlights []*highlightRule
-
-	// broker (server) state: exports console over AF_UNIX
-	brokerOn   bool
-	brokerLn   net.Listener
-	brokerPath string
-
-	brokerMu   sync.Mutex
-	brokerCli  map[*brokerClient]struct{}
-	brokerRing [][]byte // NDJSON-encoded lines for backfill
-	brokerHead int      // ring head index (next write position)
-	brokerSize int      // ring capacity == maxLines
-
-	headless bool
 }
 
 // New creates a new console UI with the given options.
@@ -159,17 +135,11 @@ func New(opts Options) *UI {
 		noColour:      opts.NoColour,
 		helpExtra:     append([]string(nil), opts.HelpExtra...),
 		topBarEnabled: !opts.DisableTopBar,
-		headless:      opts.Headless,
-
-		// broker init (deferred finish in Start)
-		brokerCli:  make(map[*brokerClient]struct{}),
-		brokerSize: opts.MaxLines,
-		brokerRing: make([][]byte, opts.MaxLines),
 	}
 
 	if opts.OnExit != nil {
 		u.onExit = opts.OnExit
-	} else if !u.headless {
+	} else {
 		u.onExit = func(code int) {
 			u.app.EnableMouse(false)
 			u.app.Stop()
@@ -178,64 +148,58 @@ func New(opts Options) *UI {
 				os.Exit(code)
 			}()
 		}
-	} else {
-		u.onExit = func(int) {}
 	}
 
-	if !u.headless {
-		u.app = tview.NewApplication()
-		u.logView = tview.NewTextView().SetScrollable(true).SetWrap(false)
-		u.inputField = tview.NewInputField().SetLabel("> ").SetFieldWidth(0)
-		u.statusText = tview.NewTextView().SetWrap(false)
-		u.topSep = tview.NewTextView().SetWrap(false)
-		u.bottomSep = tview.NewTextView().SetWrap(false)
-		u.topBar = tview.NewTextView().SetWrap(false)
+	u.app = tview.NewApplication()
+	u.logView = tview.NewTextView().SetScrollable(true).SetWrap(false)
+	u.inputField = tview.NewInputField().SetLabel("> ").SetFieldWidth(0)
+	u.statusText = tview.NewTextView().SetWrap(false)
+	u.topSep = tview.NewTextView().SetWrap(false)
+	u.bottomSep = tview.NewTextView().SetWrap(false)
+	u.topBar = tview.NewTextView().SetWrap(false)
 
-		// colour mode for text views
-		u.logView.SetDynamicColors(!u.noColour)
-		u.statusText.SetDynamicColors(!u.noColour)
-		u.topBar.SetDynamicColors(!u.noColour)
+	// colour mode for text views
+	u.logView.SetDynamicColors(!u.noColour)
+	u.statusText.SetDynamicColors(!u.noColour)
+	u.topBar.SetDynamicColors(!u.noColour)
 
-		// layout
-		var root *tview.Flex
-		if u.topBarEnabled {
-			root = tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(u.topBar, 1, 0, false).
-				AddItem(u.logView, 0, 1, false).
-				AddItem(u.bottomSep, 1, 0, false).
-				AddItem(
-					tview.NewFlex().SetDirection(tview.FlexRow).
-						AddItem(u.inputField, 1, 0, true).
-						AddItem(u.statusText, 1, 0, false),
-					2, 0, true)
-		} else {
-			root = tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(u.topSep, 1, 0, false).
-				AddItem(u.logView, 0, 1, false).
-				AddItem(u.bottomSep, 1, 0, false).
-				AddItem(
-					tview.NewFlex().SetDirection(tview.FlexRow).
-						AddItem(u.inputField, 1, 0, true).
-						AddItem(u.statusText, 1, 0, false),
-					2, 0, true)
-		}
-		u.root = root
-
-		// behavior
-		u.bindKeys()
-		u.app.EnableMouse(u.mouseOn)
-		u.app.SetRoot(u.root, true)
-		u.app.SetFocus(u.inputField)
-		u.setLogSeparators(false) // input focused
-
-		// Initial paint
-		if u.topBarEnabled {
-			u.updateTopBarDirect()
-		}
-		u.updateBottomBarDirect()
+	// layout
+	var root *tview.Flex
+	if u.topBarEnabled {
+		root = tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(u.topBar, 1, 0, false).
+			AddItem(u.logView, 0, 1, false).
+			AddItem(u.bottomSep, 1, 0, false).
+			AddItem(
+				tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(u.inputField, 1, 0, true).
+					AddItem(u.statusText, 1, 0, false),
+				2, 0, true)
 	} else {
-		u.topBarEnabled = false
+		root = tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(u.topSep, 1, 0, false).
+			AddItem(u.logView, 0, 1, false).
+			AddItem(u.bottomSep, 1, 0, false).
+			AddItem(
+				tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(u.inputField, 1, 0, true).
+					AddItem(u.statusText, 1, 0, false),
+				2, 0, true)
 	}
+	u.root = root
+
+	// behavior
+	u.bindKeys()
+	u.app.EnableMouse(u.mouseOn)
+	u.app.SetRoot(u.root, true)
+	u.app.SetFocus(u.inputField)
+	u.setLogSeparators(false) // input focused
+
+	// Initial paint
+	if u.topBarEnabled {
+		u.updateTopBarDirect()
+	}
+	u.updateBottomBarDirect()
 
 	return u
 }
@@ -245,80 +209,12 @@ func (u *UI) SetTitle(s string) {
 	u.mu.Lock()
 	u.title = s
 	u.mu.Unlock()
-	if u.headless {
-		return
-	}
 	if u.topBarEnabled {
 		u.updateTopBarDirect()
 	}
 }
 
-// Start starts the headless broker (AF_UNIX server). It does not block.
-// The attach client runs the interactive tview UI.
-func (u *UI) Start() error {
-	// choose socket path (order: /run/dhcplane/consoleui.sock → /tmp/consoleui.sock → $XDG_RUNTIME_DIR/dhcplane.sock)
-	path, ln, err := listenFirstAvailable()
-	if err != nil {
-		return err
-	}
-	_ = os.Chmod(path, 0o600)
-
-	u.brokerOn = true
-	u.brokerPath = path
-	u.brokerLn = ln
-
-	// accept loop
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				if !u.brokerOn {
-					// normal shutdown
-					return
-				}
-				// transient listener error; continue
-				continue
-			}
-			u.handleNewClient(c)
-		}
-	}()
-	return nil
-}
-
-// Stop stops the headless broker and cleans up the socket. It also stops the local UI if running.
-func (u *UI) Stop() {
-	// broker shutdown
-	u.brokerMu.Lock()
-	ln := u.brokerLn
-	path := u.brokerPath
-	u.brokerOn = false
-	u.brokerLn = nil
-	u.brokerPath = ""
-	for cli := range u.brokerCli {
-		_ = cli.bw.Flush()
-		_ = cli.conn.Close()
-		delete(u.brokerCli, cli)
-	}
-	u.brokerMu.Unlock()
-
-	if ln != nil {
-		_ = ln.Close()
-	}
-	if path != "" {
-		_ = os.Remove(path)
-	}
-
-	if u.headless || u.app == nil {
-		return
-	}
-
-	// local UI shutdown (client mode)
-	u.app.EnableMouse(false)
-	u.app.Stop()
-}
-
-// Append appends a new line to the console. It feeds both the broker stream and the local UI.
-// The server calls this as before; attached clients see the line via the socket.
+// Append appends a new line to the console UI (client side only).
 func (u *UI) Append(line string) {
 	u.appendWithWhen(time.Now(), line)
 }
@@ -403,16 +299,6 @@ func MakeTagStyler(fg, bg, attrs string) func(s string, noColour bool) string {
 // appendWithWhen is the internal implementation for Append with a provided timestamp.
 // Used by the client to preserve server-side timestamps for counters.
 func (u *UI) appendWithWhen(when time.Time, line string) {
-	// broker path: broadcast prepared NDJSON to attached clients
-	if u.brokerOn {
-		ev := wireLine{Type: "line", TsUs: when.UnixMicro(), Text: line, Level: levelOf(line)}
-		b, _ := json.Marshal(ev)
-		b = append(b, '\n')
-		u.brokerEnqueue(b)
-		u.brokerBroadcast(b)
-	}
-
-	// local UI path: unchanged visual behavior
 	u.mu.Lock()
 	u.lines = append(u.lines, line)
 	if len(u.lines) > u.maxLines {
@@ -455,10 +341,6 @@ func (u *UI) appendWithWhen(when time.Time, line string) {
 	}
 	u.counterMu.Unlock()
 
-	if u.headless {
-		return
-	}
-
 	u.Do(func() {
 		if !paused {
 			atBottom := u.atBottom()
@@ -479,17 +361,10 @@ func (u *UI) appendWithWhen(when time.Time, line string) {
 
 // Do queues the given function to be executed in the UI event loop.
 func (u *UI) Do(fn func()) {
-	if u.headless || u.app == nil {
-		fn()
-		return
-	}
 	u.app.QueueUpdateDraw(fn)
 }
 
 func (u *UI) bindKeys() {
-	if u.headless || u.app == nil || u.inputField == nil {
-		return
-	}
 	u.inputField.SetChangedFunc(func(text string) {
 		u.mu.Lock()
 		if u.filterActive {
@@ -643,9 +518,6 @@ func (u *UI) bindKeys() {
 }
 
 func (u *UI) refreshDirect() {
-	if u.headless || u.logView == nil {
-		return
-	}
 	u.logView.Clear()
 	for _, l := range u.filteredLines() {
 		fmt.Fprintln(u.logView, u.styleLine(l))
@@ -706,9 +578,6 @@ func (u *UI) rightStatus(filterOn, caseOn, mouseOn, running bool) string {
 }
 
 func (u *UI) updateBottomBarDirect() {
-	if u.headless || u.statusText == nil {
-		return
-	}
 	u.mu.Lock()
 	filterOn := u.filterActive
 	caseOn := u.filterCaseSensitive
@@ -737,7 +606,7 @@ func (u *UI) updateBottomBarDirect() {
 }
 
 func (u *UI) updateTopBarDirect() {
-	if u.headless || !u.topBarEnabled || u.topBar == nil {
+	if !u.topBarEnabled {
 		return
 	}
 	u.mu.Lock()
@@ -760,9 +629,6 @@ func (u *UI) updateTopBarDirect() {
 }
 
 func (u *UI) setLogSeparators(focused bool) {
-	if u.headless || u.logView == nil || u.bottomSep == nil {
-		return
-	}
 	_, _, w, _ := u.logView.GetInnerRect()
 	if w <= 0 {
 		w = 1
@@ -922,9 +788,6 @@ func (u *UI) counterSnapshot() string {
 }
 
 func (u *UI) showHelpModal() {
-	if u.headless || u.app == nil {
-		return
-	}
 	u.prevFocus = u.app.GetFocus()
 	lines := []string{
 		u.title,
@@ -979,9 +842,6 @@ func (u *UI) showHelpModal() {
 }
 
 func (u *UI) closeModal() {
-	if u.headless || u.app == nil {
-		return
-	}
 	if u.modal == nil {
 		return
 	}
@@ -1015,35 +875,12 @@ func visualLen(s string) int {
 	return n
 }
 
-// ---- broker (server) helpers ----
-
 // levelOf derives a coarse level from the line prefix.
 func levelOf(s string) string {
 	if strings.HasPrefix(s, "ERROR: ") {
 		return "error"
 	}
 	return "info"
-}
-
-// listenFirstAvailable tries to bind the socket in the required order and returns the chosen path and listener.
-// Order: /run/dhcplane/consoleui.sock → /tmp/consoleui.sock → $XDG_RUNTIME_DIR/dhcplane.sock
-func listenFirstAvailable() (string, net.Listener, error) {
-	candidates := []string{
-		"/run/dhcplane/consoleui.sock",
-		"/tmp/consoleui.sock",
-	}
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		candidates = append(candidates, filepath.Join(xdg, "dhcplane.sock"))
-	}
-	for _, p := range candidates {
-		_ = os.MkdirAll(filepath.Dir(p), 0o755)
-		_ = os.Remove(p) // unlink stale
-		ln, err := net.Listen("unix", p)
-		if err == nil {
-			return p, ln, nil
-		}
-	}
-	return "", nil, errors.New("console broker: no usable UNIX socket path")
 }
 
 // chooseSocketPathForDial picks the first existing socket path in the same order.
@@ -1062,145 +899,6 @@ func chooseSocketPathForDial() (string, error) {
 		}
 	}
 	return "", errors.New("console attach: UNIX socket not found in default locations")
-}
-
-// snapshotMeta prepares the current rules and limits for a new client.
-func (u *UI) snapshotMeta() wireMeta {
-	u.counterMu.Lock()
-	defer u.counterMu.Unlock()
-	u.hlMu.Lock()
-	defer u.hlMu.Unlock()
-
-	m := wireMeta{
-		Type:     "meta",
-		MaxLines: u.maxLines,
-	}
-	for _, c := range u.counters {
-		m.Counters = append(m.Counters, wireCounter{
-			Match:         c.match,
-			CaseSensitive: c.caseSensitive,
-			Label:         c.label,
-			WindowS:       int(c.window / time.Second),
-		})
-	}
-	for _, h := range u.highlights {
-		// Only style-based highlights are serialized. Custom stylers are not transferred.
-		if h.style != nil {
-			cp := *h.style
-			m.Highlights = append(m.Highlights, wireHighlight{
-				Match:         h.match,
-				CaseSensitive: h.caseSensitive,
-				Style:         &cp,
-			})
-		}
-	}
-	return m
-}
-
-// handleNewClient registers a new viewer, sends meta + backfill, and starts the writer goroutine.
-func (u *UI) handleNewClient(c net.Conn) {
-	u.brokerMu.Lock()
-	defer u.brokerMu.Unlock()
-
-	// enforce max concurrent viewers (5)
-	if len(u.brokerCli) >= 5 {
-		_ = c.Close()
-		return
-	}
-
-	cli := &brokerClient{
-		conn: c,
-		bw:   bufio.NewWriterSize(c, 64<<10),
-		ch:   make(chan []byte, 1024),
-	}
-	u.brokerCli[cli] = struct{}{}
-
-	// writer loop
-	go func() {
-		defer func() {
-			u.brokerMu.Lock()
-			delete(u.brokerCli, cli)
-			u.brokerMu.Unlock()
-			_ = cli.bw.Flush()
-			_ = cli.conn.Close()
-		}()
-		for b := range cli.ch {
-			if _, err := cli.bw.Write(b); err != nil {
-				return
-			}
-			if err := cli.bw.Flush(); err != nil {
-				return
-			}
-		}
-	}()
-
-	// send meta
-	meta := u.snapshotMeta()
-	if b, err := json.Marshal(meta); err == nil {
-		_ = u.safeSend(cli, append(b, '\n'))
-	}
-
-	// send full backfill (ring in chronological order)
-	for i := 0; i < u.brokerSize; i++ {
-		idx := (u.brokerHead + i) % u.brokerSize
-		if u.brokerRing[idx] != nil {
-			_ = u.safeSend(cli, u.brokerRing[idx])
-		}
-	}
-}
-
-// brokerEnqueue writes a line to the ring buffer.
-func (u *UI) brokerEnqueue(b []byte) {
-	u.brokerMu.Lock()
-	u.brokerRing[u.brokerHead] = b
-	u.brokerHead = (u.brokerHead + 1) % u.brokerSize
-	u.brokerMu.Unlock()
-}
-
-// brokerBroadcast pushes a line to all clients. Slow client policy: drop-oldest with notice.
-func (u *UI) brokerBroadcast(b []byte) {
-	u.brokerMu.Lock()
-	defer u.brokerMu.Unlock()
-	for cli := range u.brokerCli {
-		if !u.trySend(cli, b) {
-			// queue full: drop-oldest until there is space, count drops
-			var dropped int
-			for len(cli.ch) == cap(cli.ch) {
-				<-cli.ch
-				dropped++
-			}
-			// send the current line
-			_ = u.trySend(cli, b)
-			// notify this viewer only about dropped lines
-			if dropped > 0 {
-				n := wireNotice{Type: "notice", Text: fmt.Sprintf("[viewer lagged; dropped %d lines]", dropped)}
-				nb, _ := json.Marshal(n)
-				nb = append(nb, '\n')
-				_ = u.trySend(cli, nb)
-			}
-		}
-	}
-}
-
-func (u *UI) trySend(cli *brokerClient, b []byte) bool {
-	select {
-	case cli.ch <- b:
-		return true
-	default:
-		return false
-	}
-}
-
-func (u *UI) safeSend(cli *brokerClient, b []byte) error {
-	select {
-	case cli.ch <- b:
-		return nil
-	default:
-		// drop oldest to make room
-		<-cli.ch
-		cli.ch <- b
-		return nil
-	}
 }
 
 // ---- attach client ----
