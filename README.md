@@ -438,8 +438,6 @@ Global flags (apply to all commands unless noted):
   Path to JSON config (default `config.json`)
 - `--console`
   Serve the interactive console over UNIX socket (logs always print to stdout/stderr)
-- `--nocolour`
-  Disable ANSI colours in console output
 
 Command-specific flags:
 

@@ -1004,10 +1004,9 @@ func Attach(opts AttachOptions) error {
 // ---- cobra integration (same binary client command) ----
 
 // InstallAttachCommand adds a "console attach" subcommand to the provided Cobra root.
-// Usage: dhcplane console attach [--socket PATH] [--nocolour] [--transparent]
+// Usage: dhcplane console attach [--socket PATH] [--transparent]
 func InstallAttachCommand(root *cobra.Command) {
 	var socket string
-	var nocolour bool
 	var transparent bool
 
 	consoleCmd := &cobra.Command{
@@ -1020,14 +1019,12 @@ func InstallAttachCommand(root *cobra.Command) {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return Attach(AttachOptions{
 				Socket:      socket,
-				NoColour:    nocolour,
 				Transparent: transparent,
 				Title:       "DHCPlane Console (attached)",
 			})
 		},
 	}
 	attachCmd.Flags().StringVar(&socket, "socket", "", "UNIX socket path override")
-	attachCmd.Flags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours")
 	attachCmd.Flags().BoolVar(&transparent, "transparent", false, "Use terminal background")
 
 	consoleCmd.AddCommand(attachCmd)

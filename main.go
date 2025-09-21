@@ -27,7 +27,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var appVersion = "0.1.39"
+var appVersion = "0.1.41"
 
 // buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
 func buildConsoleBroker(maxLines int) *consoleui.Broker {
@@ -114,7 +114,7 @@ func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
 }
 
 // buildServerAndRun starts the DHCP server and optional console broker, handles reloads and signals.
-func buildServerAndRun(cfgPath string, console bool, nocolour bool) error {
+func buildServerAndRun(cfgPath string, console bool) error {
 	// Load + validate/normalize initial config
 	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
@@ -538,7 +538,6 @@ func main() {
 	var (
 		cfgPath     string
 		console     bool
-		nocolour    bool
 		showVersion bool
 	)
 
@@ -557,7 +556,6 @@ func main() {
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.json", "Path to JSON config")
 	// authoritative is now config-driven; flag removed
 	root.PersistentFlags().BoolVar(&console, "console", false, "Export console over UNIX socket in addition to stdout/stderr logging")
-	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
 
 	// Inject the client-side attach command into this binary.
 	consoleui.InstallAttachCommand(root)
@@ -577,7 +575,7 @@ func main() {
 				return fmt.Errorf("config error: %w", jerr)
 			}
 
-			return buildServerAndRun(cfgPath, console, nocolour)
+			return buildServerAndRun(cfgPath, console)
 		},
 	}
 
