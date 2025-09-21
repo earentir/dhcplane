@@ -154,7 +154,8 @@ func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
 	}
 }
 
-func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, logPath string, console bool, stdoutLog bool, pidPath string, nocolour bool) error {
+// buildServerAndRun starts the DHCP server and optional console broker, handles reloads and signals.
+func buildServerAndRun(cfgPath string, leasePath string, logPath string, console bool, stdoutLog bool, pidPath string, nocolour bool) error {
 	// Load + validate/normalize initial config
 	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
@@ -182,7 +183,7 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		}
 	}()
 
-	// Optional console UI
+	// Optional console UI (now broker-backed; Start() serves the UNIX socket)
 	var ui *consoleui.UI
 	if console {
 		maxLines := cfg.ConsoleMaxLines
@@ -239,8 +240,14 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 	cfgAtomic.Store(&cfg)
 	cfgGet := func() *config.Config { return cfgAtomic.Load().(*config.Config) }
 
-	// Authoritative getter
-	authorGet := func() bool { return authoritative }
+	// Authoritative getter from config (default: true when unset)
+	effectiveAuthoritative := func(c *config.Config) bool {
+		if c == nil || c.Authoritative == nil {
+			return true
+		}
+		return *c.Authoritative
+	}
+	authorGet := func() bool { return effectiveAuthoritative(cfgGet()) }
 
 	// One-shot compaction on initial load ONLY if enabled
 	if cfg.CompactOnLoad {
@@ -283,9 +290,9 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 		return fmt.Errorf("bind: %w (need root/CAP_NET_BIND_SERVICE)", err)
 	}
 
-	logSink("START iface=%q bind=%s server_ip=%s subnet=%s gateway=%s lease=%s sticky=%s",
+	logSink("START iface=%q bind=%s server_ip=%s subnet=%s gateway=%s lease=%s sticky=%s authoritative=%v",
 		currentIface, laddr.String(), cfg.ServerIP, cfg.SubnetCIDR, cfg.Gateway,
-		time.Duration(cfg.LeaseSeconds)*time.Second, time.Duration(cfg.LeaseStickySeconds)*time.Second)
+		time.Duration(cfg.LeaseSeconds)*time.Second, time.Duration(cfg.LeaseStickySeconds)*time.Second, effectiveAuthoritative(&cfg))
 	if cfg.AutoReload {
 		logSink("START auto_reload=true (watching %s)", cfgPath)
 	}
@@ -327,6 +334,10 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 	var watcherErr error
 	if cfg.AutoReload {
 		watcher, watcherErr = startConfigWatcher(cfgPath, func(newCfg config.Config, newWarns []string) {
+			// Compare authoritative before swapping
+			oldAuth := effectiveAuthoritative(cfgGet())
+			newAuth := effectiveAuthoritative(&newCfg)
+
 			cfgAtomic.Store(&newCfg)
 			for _, w := range newWarns {
 				logSink("%s", w)
@@ -343,6 +354,11 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				} else {
 					logSink("AUTO-RELOAD: rebound to iface=%q", newCfg.Interface)
 				}
+			}
+			if oldAuth != newAuth {
+				logSink("AUTO-RELOAD: authoritative %v -> %v", oldAuth, newAuth)
+			} else {
+				logSink("AUTO-RELOAD: authoritative=%v", newAuth)
 			}
 			logSink("AUTO-RELOAD: config applied")
 
@@ -410,6 +426,11 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 			for _, w := range newWarns {
 				logSink("%s", w)
 			}
+
+			// Compare before swap
+			oldAuth := effectiveAuthoritative(cfgGet())
+			newAuth := effectiveAuthoritative(&newCfg)
+
 			cfgAtomic.Store(&newCfg)
 			dhcpserver.EnforceReservationLeaseConsistency(db, &newCfg)
 			if newCfg.CompactOnLoad {
@@ -423,6 +444,11 @@ func buildServerAndRun(cfgPath string, leasePath string, authoritative bool, log
 				} else {
 					logSink("RELOAD: rebound to iface=%q", newCfg.Interface)
 				}
+			}
+			if oldAuth != newAuth {
+				logSink("RELOAD: authoritative %v -> %v", oldAuth, newAuth)
+			} else {
+				logSink("RELOAD: authoritative=%v", newAuth)
 			}
 			logSink("RELOAD: config applied")
 
@@ -553,15 +579,14 @@ func loadDBAndConfig(leasePath, cfgPath string) (*dhcpserver.LeaseDB, config.Con
 
 func main() {
 	var (
-		cfgPath       string
-		leasePath     string
-		authoritative bool
-		logPath       string
-		console       bool
-		stdoutLog     bool
-		pidPath       string
-		nocolour      bool
-		showVersion   bool
+		cfgPath     string
+		leasePath   string
+		logPath     string
+		console     bool
+		stdoutLog   bool
+		pidPath     string
+		nocolour    bool
+		showVersion bool
 	)
 
 	root := &cobra.Command{
@@ -578,19 +603,21 @@ func main() {
 	root.PersistentFlags().BoolVarP(&showVersion, "version", "", false, "Print version and exit")
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.json", "Path to JSON config")
 	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
-	root.PersistentFlags().BoolVar(&authoritative, "authoritative", true, "Send NAKs on invalid requests")
-	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path (empty to log only to console)")
-	root.PersistentFlags().BoolVar(&console, "console", false, "Also print logs to stdout in addition to --log")
+	// authoritative is now config-driven; flag removed
+	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path")
+	root.PersistentFlags().BoolVar(&console, "console", false, "Also expose an interactive console over UNIX socket and mirror to stdout when enabled")
 	root.PersistentFlags().BoolVar(&stdoutLog, "stdout", false, "Mirror logs to stdout/stderr (for systemd/journald); cannot combine with --console")
 	root.PersistentFlags().StringVar(&pidPath, "pid-file", "dhcplane.pid", "PID file for reload control")
 	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
 	root.PersistentFlags().BoolVar(&transparent, "transparent", false, "Use terminal background (no solid fill)")
 
+	// Inject the client-side attach command into this binary.
+	consoleui.InstallAttachCommand(root)
+
 	/* ---- serve ---- */
 	serveCmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the DHCP server",
-		// serveCmd RunE (anonymous func) — with default config generation
 		RunE: func(_ *cobra.Command, _ []string) error {
 			// Validate flag exclusivity
 			if console && stdoutLog {
@@ -612,7 +639,7 @@ func main() {
 				tview.Styles.ContrastBackgroundColor = tcell.ColorDefault
 				tview.Styles.MoreContrastBackgroundColor = tcell.ColorDefault
 			}
-			return buildServerAndRun(cfgPath, leasePath, authoritative, logPath, console, stdoutLog, pidPath, nocolour)
+			return buildServerAndRun(cfgPath, leasePath, logPath, console, stdoutLog, pidPath, nocolour)
 		},
 	}
 
@@ -1068,6 +1095,7 @@ func ensureDefaultConfig(cfgPath string) error {
 		"compact_on_load":          false,
 		"dns":                      []string{"192.168.1.1", "1.1.1.1"},
 		"domain":                   "lan",
+		"authoritative":            true, // default authoritative if unset
 		"lease_seconds":            3600,
 		"lease_sticky_seconds":     3600,
 		"auto_reload":              true,
@@ -1086,6 +1114,7 @@ func ensureDefaultConfig(cfgPath string) error {
 		"vendor_specific_43_hex":   "",
 		"device_overrides":         map[string]any{},
 		"vendor_class_overrides":   map[string]any{}, // Vendor Class overrides (by option 60 string)
+		"user_class_overrides_77":  map[string]any{},
 		"enable_broadcast_28":      false,
 		"use_classful_routes_33":   false,
 		"routes_33":                []map[string]string{}, // {"destination":"a.b.c.0","gateway":"x.y.z.w"}

@@ -97,6 +97,10 @@ type Config struct {
 	DNS           []string `json:"dns"`
 	Domain        string   `json:"domain,omitempty"`
 
+	// Authoritative mode: when true, server sends NAKs on invalid requests.
+	// Nil means "unset" and defaults to true.
+	Authoritative *bool `json:"authoritative,omitempty"`
+
 	LeaseSeconds       int  `json:"lease_seconds"`
 	LeaseStickySeconds int  `json:"lease_sticky_seconds,omitempty"`
 	AutoReload         bool `json:"auto_reload,omitempty"`
@@ -318,6 +322,12 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 	c := cfg
 	var warns []string
 
+	// Default: authoritative=true when unset.
+	if c.Authoritative == nil {
+		v := true
+		c.Authoritative = &v
+	}
+
 	if len(c.EquipmentTypes) == 0 {
 		c.EquipmentTypes = []string{"Switch", "Router", "AP", "Modem", "Gateway"}
 	}
@@ -464,9 +474,6 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 
 		// Defaults
 		if !d.Enabled {
-			// keep explicit false if user set it; otherwise default true
-			// We cannot distinguish explicit false via struct tags, so default to true only if all fields zeroed.
-			// Heuristic: if ActiveProbe/ProbeInterval/RateLimit all zero values and whitelist empty, assume unset and default Enabled=true.
 			if d.ActiveProbe == "" && d.ProbeInterval == 0 && d.RateLimit == 0 && len(d.WhitelistServers) == 0 {
 				d.Enabled = true
 			}
@@ -477,7 +484,6 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 		d.ActiveProbe = strings.ToLower(strings.TrimSpace(d.ActiveProbe))
 		switch d.ActiveProbe {
 		case "off", "safe", "aggressive":
-			// ok
 		default:
 			warns = append(warns, fmt.Sprintf("warning: detect_dhcp_servers.active_probe %q not in {off,safe,aggressive}; using off", d.ActiveProbe))
 			d.ActiveProbe = "off"
@@ -498,7 +504,7 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 			d.RateLimit = 1
 		}
 
-		// Normalize whitelist entries: accept IPv4s as-is, MACs normalized, drop invalids with warning
+		// Normalize whitelist entries
 		if len(d.WhitelistServers) > 0 {
 			out := make([]string, 0, len(d.WhitelistServers))
 			for _, w := range d.WhitelistServers {
