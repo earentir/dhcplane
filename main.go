@@ -39,6 +39,7 @@ func buildConsoleUI(nocolour bool, maxLines int) *consoleui.UI {
 		MaxLines:     maxLines,
 		MouseEnabled: true,
 		OnExit:       nil,
+		Headless:     true,
 	})
 	ui.SetTitle(fmt.Sprintf("DHCPlane Console v%s", appVersion))
 

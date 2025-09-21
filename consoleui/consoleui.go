@@ -38,6 +38,7 @@ type Options struct {
 	HelpExtra     []string
 	OnExit        func(code int)
 	DisableTopBar bool // false = show top bar (Title | Counters); true = legacy: no top bar
+	Headless      bool
 }
 
 type counterRule struct {
@@ -142,6 +143,8 @@ type UI struct {
 	brokerRing [][]byte // NDJSON-encoded lines for backfill
 	brokerHead int      // ring head index (next write position)
 	brokerSize int      // ring capacity == maxLines
+
+	headless bool
 }
 
 // New creates a new console UI with the given options.
@@ -150,19 +153,13 @@ func New(opts Options) *UI {
 		opts.MaxLines = 10000
 	}
 	u := &UI{
-		app:           tview.NewApplication(),
-		logView:       tview.NewTextView().SetScrollable(true).SetWrap(false),
-		inputField:    tview.NewInputField().SetLabel("> ").SetFieldWidth(0),
-		statusText:    tview.NewTextView().SetWrap(false),
-		topSep:        tview.NewTextView().SetWrap(false),
-		bottomSep:     tview.NewTextView().SetWrap(false),
-		topBar:        tview.NewTextView().SetWrap(false),
 		lines:         make([]string, 0, opts.MaxLines),
 		maxLines:      opts.MaxLines,
 		mouseOn:       opts.MouseEnabled,
 		noColour:      opts.NoColour,
 		helpExtra:     append([]string(nil), opts.HelpExtra...),
 		topBarEnabled: !opts.DisableTopBar,
+		headless:      opts.Headless,
 
 		// broker init (deferred finish in Start)
 		brokerCli:  make(map[*brokerClient]struct{}),
@@ -172,7 +169,7 @@ func New(opts Options) *UI {
 
 	if opts.OnExit != nil {
 		u.onExit = opts.OnExit
-	} else {
+	} else if !u.headless {
 		u.onExit = func(code int) {
 			u.app.EnableMouse(false)
 			u.app.Stop()
@@ -181,52 +178,64 @@ func New(opts Options) *UI {
 				os.Exit(code)
 			}()
 		}
-	}
-
-	// colour mode for text views
-	u.logView.SetDynamicColors(!u.noColour)
-	u.statusText.SetDynamicColors(!u.noColour)
-	u.topBar.SetDynamicColors(!u.noColour)
-
-	// layout
-	var root *tview.Flex
-	if u.topBarEnabled {
-		// Top bar replaces the top border line.
-		root = tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(u.topBar, 1, 0, false).
-			AddItem(u.logView, 0, 1, false).
-			AddItem(u.bottomSep, 1, 0, false).
-			AddItem(
-				tview.NewFlex().SetDirection(tview.FlexRow).
-					AddItem(u.inputField, 1, 0, true).
-					AddItem(u.statusText, 1, 0, false),
-				2, 0, true)
 	} else {
-		// Legacy mode: keep top border, no top bar.
-		root = tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(u.topSep, 1, 0, false).
-			AddItem(u.logView, 0, 1, false).
-			AddItem(u.bottomSep, 1, 0, false).
-			AddItem(
-				tview.NewFlex().SetDirection(tview.FlexRow).
-					AddItem(u.inputField, 1, 0, true).
-					AddItem(u.statusText, 1, 0, false),
-				2, 0, true)
+		u.onExit = func(int) {}
 	}
-	u.root = root
 
-	// behavior
-	u.bindKeys()
-	u.app.EnableMouse(u.mouseOn)
-	u.app.SetRoot(u.root, true)
-	u.app.SetFocus(u.inputField)
-	u.setLogSeparators(false) // input focused
+	if !u.headless {
+		u.app = tview.NewApplication()
+		u.logView = tview.NewTextView().SetScrollable(true).SetWrap(false)
+		u.inputField = tview.NewInputField().SetLabel("> ").SetFieldWidth(0)
+		u.statusText = tview.NewTextView().SetWrap(false)
+		u.topSep = tview.NewTextView().SetWrap(false)
+		u.bottomSep = tview.NewTextView().SetWrap(false)
+		u.topBar = tview.NewTextView().SetWrap(false)
 
-	// Initial paint
-	if u.topBarEnabled {
-		u.updateTopBarDirect()
+		// colour mode for text views
+		u.logView.SetDynamicColors(!u.noColour)
+		u.statusText.SetDynamicColors(!u.noColour)
+		u.topBar.SetDynamicColors(!u.noColour)
+
+		// layout
+		var root *tview.Flex
+		if u.topBarEnabled {
+			root = tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(u.topBar, 1, 0, false).
+				AddItem(u.logView, 0, 1, false).
+				AddItem(u.bottomSep, 1, 0, false).
+				AddItem(
+					tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(u.inputField, 1, 0, true).
+						AddItem(u.statusText, 1, 0, false),
+					2, 0, true)
+		} else {
+			root = tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(u.topSep, 1, 0, false).
+				AddItem(u.logView, 0, 1, false).
+				AddItem(u.bottomSep, 1, 0, false).
+				AddItem(
+					tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(u.inputField, 1, 0, true).
+						AddItem(u.statusText, 1, 0, false),
+					2, 0, true)
+		}
+		u.root = root
+
+		// behavior
+		u.bindKeys()
+		u.app.EnableMouse(u.mouseOn)
+		u.app.SetRoot(u.root, true)
+		u.app.SetFocus(u.inputField)
+		u.setLogSeparators(false) // input focused
+
+		// Initial paint
+		if u.topBarEnabled {
+			u.updateTopBarDirect()
+		}
+		u.updateBottomBarDirect()
+	} else {
+		u.topBarEnabled = false
 	}
-	u.updateBottomBarDirect()
 
 	return u
 }
@@ -236,6 +245,9 @@ func (u *UI) SetTitle(s string) {
 	u.mu.Lock()
 	u.title = s
 	u.mu.Unlock()
+	if u.headless {
+		return
+	}
 	if u.topBarEnabled {
 		u.updateTopBarDirect()
 	}
@@ -294,6 +306,10 @@ func (u *UI) Stop() {
 	}
 	if path != "" {
 		_ = os.Remove(path)
+	}
+
+	if u.headless || u.app == nil {
+		return
 	}
 
 	// local UI shutdown (client mode)
@@ -439,6 +455,10 @@ func (u *UI) appendWithWhen(when time.Time, line string) {
 	}
 	u.counterMu.Unlock()
 
+	if u.headless {
+		return
+	}
+
 	u.Do(func() {
 		if !paused {
 			atBottom := u.atBottom()
@@ -458,9 +478,18 @@ func (u *UI) appendWithWhen(when time.Time, line string) {
 }
 
 // Do queues the given function to be executed in the UI event loop.
-func (u *UI) Do(fn func()) { u.app.QueueUpdateDraw(fn) }
+func (u *UI) Do(fn func()) {
+	if u.headless || u.app == nil {
+		fn()
+		return
+	}
+	u.app.QueueUpdateDraw(fn)
+}
 
 func (u *UI) bindKeys() {
+	if u.headless || u.app == nil || u.inputField == nil {
+		return
+	}
 	u.inputField.SetChangedFunc(func(text string) {
 		u.mu.Lock()
 		if u.filterActive {
@@ -614,6 +643,9 @@ func (u *UI) bindKeys() {
 }
 
 func (u *UI) refreshDirect() {
+	if u.headless || u.logView == nil {
+		return
+	}
 	u.logView.Clear()
 	for _, l := range u.filteredLines() {
 		fmt.Fprintln(u.logView, u.styleLine(l))
@@ -674,6 +706,9 @@ func (u *UI) rightStatus(filterOn, caseOn, mouseOn, running bool) string {
 }
 
 func (u *UI) updateBottomBarDirect() {
+	if u.headless || u.statusText == nil {
+		return
+	}
 	u.mu.Lock()
 	filterOn := u.filterActive
 	caseOn := u.filterCaseSensitive
@@ -702,7 +737,7 @@ func (u *UI) updateBottomBarDirect() {
 }
 
 func (u *UI) updateTopBarDirect() {
-	if !u.topBarEnabled {
+	if u.headless || !u.topBarEnabled || u.topBar == nil {
 		return
 	}
 	u.mu.Lock()
@@ -725,6 +760,9 @@ func (u *UI) updateTopBarDirect() {
 }
 
 func (u *UI) setLogSeparators(focused bool) {
+	if u.headless || u.logView == nil || u.bottomSep == nil {
+		return
+	}
 	_, _, w, _ := u.logView.GetInnerRect()
 	if w <= 0 {
 		w = 1
@@ -884,6 +922,9 @@ func (u *UI) counterSnapshot() string {
 }
 
 func (u *UI) showHelpModal() {
+	if u.headless || u.app == nil {
+		return
+	}
 	u.prevFocus = u.app.GetFocus()
 	lines := []string{
 		u.title,
@@ -938,6 +979,9 @@ func (u *UI) showHelpModal() {
 }
 
 func (u *UI) closeModal() {
+	if u.headless || u.app == nil {
+		return
+	}
 	if u.modal == nil {
 		return
 	}
