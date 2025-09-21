@@ -66,7 +66,7 @@ sudo setcap 'cap_net_bind_service=+ep' "$(pwd)/dhcplane"
 ./dhcplane serve --console
 ```
 
-> Tip: set `--log dhcplane.log --console` to log to file **and** echo to stdout.
+> Tip: add `--console` to expose the interactive console socket while still seeing logs on stdout/stderr.
 
 ---
 
@@ -243,7 +243,7 @@ Banned MACs can be declared in config under `banned_macs` (with optional metadat
 Banned MACs:
 
 - Are logged on contact
-- Receive a NAK to requests if `--authoritative` is enabled
+- Receive a NAK on DHCP REQUEST when the config’s `authoritative` flag is true (default)
 - Are marked in the **grid** and **details** outputs
 
 ### Per-device overrides
@@ -322,8 +322,7 @@ Serve with console echo and file log:
   --config ./config.json \
   --lease-db ./leases.json \
   --log ./dhcplane.log \
-  --console \
-  --authoritative
+  --console
 ```
 
 Check the config:
@@ -437,12 +436,10 @@ Global flags (apply to all commands unless noted):
   Path to JSON config (default `config.json`)
 - `--lease-db string`
   Path to leases DB (default `leases.json`)
-- `--authoritative`
-  Send NAKs on invalid requests (default **true**, used by `serve`)
 - `--log string`
   Log file path (empty = console-only). Default `dhcplane.log`
 - `--console`
-  Also print logs to stdout (in addition to `--log`)
+  Serve the interactive console over UNIX socket (logs always print to stdout/stderr)
 - `--pid-file string`
   PID file path (default `dhcplane.pid`)
 
@@ -476,7 +473,7 @@ When `auto_reload` is true, the process also watches the config file’s directo
 
 ## Logging
 
-- File logger is created at `--log` path. Use `--console` to also mirror logs to stdout.
+- File logger is created at `--log` path; logs are always mirrored to stdout/stderr.
 - Internal errors are additionally printed to stderr in red for operator visibility.
 - PID file is written at `--pid-file`.
 
@@ -494,7 +491,7 @@ ACK aa:bb:cc:dd:ee:ff <- 192.168.178.100 lease=24h0m0s (alloc=2025/09/05 20:40:0
 
 ## Security notes
 
-- Only enable `--authoritative` on a network where this server should NAK competing/invalid requests.
+- Only enable `authoritative` in the config on networks where this server should NAK competing/invalid requests.
 - Use `exclusions` to protect infrastructure IPs that are inside pools.
 - Banned MACs are enforced at request time; keep in mind MAC spoofing is possible on L2.
 - Consider running under a service account with only `cap_net_bind_service` capability if possible, not full root.

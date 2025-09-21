@@ -146,7 +146,7 @@ func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
 }
 
 // buildServerAndRun starts the DHCP server and optional console broker, handles reloads and signals.
-func buildServerAndRun(cfgPath string, leasePath string, logPath string, console bool, stdoutLog bool, pidPath string, nocolour bool) error {
+func buildServerAndRun(cfgPath string, leasePath string, logPath string, console bool, pidPath string, nocolour bool) error {
 	// Load + validate/normalize initial config
 	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
@@ -201,9 +201,7 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 			broker.Append(ts + " " + msg)
 		}
 
-		if stdoutLog {
-			fmt.Fprintln(os.Stdout, msg)
-		}
+		fmt.Fprintln(os.Stdout, msg)
 	}
 	errorSink := func(format string, args ...any) {
 		msg := fmt.Sprintf("ERROR: "+format, args...)
@@ -214,9 +212,7 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 		if broker != nil {
 			broker.Append(ts + " " + msg)
 		}
-		if stdoutLog {
-			fmt.Fprintln(os.Stderr, msg)
-		}
+		fmt.Fprintln(os.Stderr, msg)
 	}
 
 	// Log initial warnings
@@ -572,7 +568,6 @@ func main() {
 		leasePath   string
 		logPath     string
 		console     bool
-		stdoutLog   bool
 		pidPath     string
 		nocolour    bool
 		showVersion bool
@@ -594,8 +589,7 @@ func main() {
 	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
 	// authoritative is now config-driven; flag removed
 	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path")
-	root.PersistentFlags().BoolVar(&console, "console", false, "Also expose an interactive console over UNIX socket and mirror to stdout when enabled")
-	root.PersistentFlags().BoolVar(&stdoutLog, "stdout", false, "Mirror logs to stdout/stderr (for systemd/journald); cannot combine with --console")
+	root.PersistentFlags().BoolVar(&console, "console", false, "Export console over UNIX socket in addition to stdout/stderr logging")
 	root.PersistentFlags().StringVar(&pidPath, "pid-file", "dhcplane.pid", "PID file for reload control")
 	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
 	root.PersistentFlags().BoolVar(&transparent, "transparent", false, "Use terminal background (no solid fill)")
@@ -608,11 +602,6 @@ func main() {
 		Use:   "serve",
 		Short: "Start the DHCP server",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			// Validate flag exclusivity
-			if console && stdoutLog {
-				return fmt.Errorf("--stdout cannot be used with --console")
-			}
-
 			// Create a default config if missing
 			if err := ensureDefaultConfig(cfgPath); err != nil {
 				return fmt.Errorf("default config: %w", err)
@@ -628,7 +617,7 @@ func main() {
 				tview.Styles.ContrastBackgroundColor = tcell.ColorDefault
 				tview.Styles.MoreContrastBackgroundColor = tcell.ColorDefault
 			}
-			return buildServerAndRun(cfgPath, leasePath, logPath, console, stdoutLog, pidPath, nocolour)
+			return buildServerAndRun(cfgPath, leasePath, logPath, console, pidPath, nocolour)
 		},
 	}
 
