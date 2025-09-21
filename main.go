@@ -22,15 +22,12 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/gdamore/tcell/v2"
 	"github.com/logrusorgru/aurora"
-	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var appVersion = "0.1.39"
-var transparent bool
 
 // buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
 func buildConsoleBroker(maxLines int) *consoleui.Broker {
@@ -53,53 +50,24 @@ func buildConsoleBroker(maxLines int) *consoleui.Broker {
 
 /* ----------------- Logging ----------------- */
 
-func setupLogger(flagPath string, cfg config.Config) (*log.Logger, io.Closer, error) {
-	// Config-driven rotating file if logging is specified in config.
-	if cfg.Logging.Path != "" || cfg.Logging.Filename != "" {
-		full := cfg.Logging.Filename
-		if cfg.Logging.Path != "" {
-			full = filepath.Join(cfg.Logging.Path, cfg.Logging.Filename)
-		}
-		if full == "" {
-			return nil, nil, fmt.Errorf("logging.filename is required when logging.path is set")
-		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil && !os.IsExist(err) {
-			return nil, nil, err
-		}
-		rot := &lumberjack.Logger{
-			Filename: full,
-			MaxSize: func() int {
-				if cfg.Logging.MaxSize > 0 {
-					return cfg.Logging.MaxSize
-				}
-				return 20
-			}(),
-			MaxBackups: func() int {
-				if cfg.Logging.MaxBackups > 0 {
-					return cfg.Logging.MaxBackups
-				}
-				return 5
-			}(),
-			MaxAge:   cfg.Logging.MaxAge, // 0 means no age-based pruning
-			Compress: true,               // gzip; lumberjack doesn't support zstd
-		}
-		lg := log.New(rot, "", log.LstdFlags|log.Lmicroseconds)
-		return lg, rot, nil
+func setupLogger(cfg config.Config) (*log.Logger, io.Closer, error) {
+	filename := cfg.Logging.Filename
+	if filename == "" {
+		filename = "dhcplane.log"
 	}
-
-	// No logging section: keep old default path and rotate with defaults.
-	if flagPath == "" {
-		flagPath = "dhcplane.log"
+	full := filename
+	if cfg.Logging.Path != "" {
+		full = filepath.Join(cfg.Logging.Path, filename)
 	}
-	if err := os.MkdirAll(filepath.Dir(flagPath), 0o755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil && !os.IsExist(err) {
 		return nil, nil, err
 	}
 	rot := &lumberjack.Logger{
-		Filename:   flagPath,
-		MaxSize:    20, // MB
-		MaxBackups: 5,
-		MaxAge:     0,
-		Compress:   true, // gzip
+		Filename:   full,
+		MaxSize:    cfg.Logging.MaxSize,
+		MaxBackups: cfg.Logging.MaxBackups,
+		MaxAge:     cfg.Logging.MaxAge,
+		Compress:   cfg.Logging.Compress,
 	}
 	lg := log.New(rot, "", log.LstdFlags|log.Lmicroseconds)
 	return lg, rot, nil
@@ -146,7 +114,7 @@ func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
 }
 
 // buildServerAndRun starts the DHCP server and optional console broker, handles reloads and signals.
-func buildServerAndRun(cfgPath string, leasePath string, logPath string, console bool, pidPath string, nocolour bool) error {
+func buildServerAndRun(cfgPath string, console bool, nocolour bool) error {
 	// Load + validate/normalize initial config
 	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
@@ -157,14 +125,14 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 		return fmt.Errorf("config validation: %w", verr)
 	}
 
-	// Lease DB
+	leasePath := cfg.LeaseDBPath
 	db := dhcpserver.NewLeaseDB(leasePath)
 	if err := db.Load(); err != nil {
 		log.Printf("lease db load: %v (continuing with empty)", err)
 	}
 
 	// Logger (file or rotating)
-	lg, closer, err := setupLogger(logPath, cfg)
+	lg, closer, err := setupLogger(cfg)
 	if err != nil {
 		return fmt.Errorf("logger: %w", err)
 	}
@@ -246,7 +214,7 @@ func buildServerAndRun(cfgPath string, leasePath string, logPath string, console
 	dhcpserver.EnforceReservationLeaseConsistency(db, &cfg)
 
 	// PID
-	if err := writePID(pidPath); err != nil {
+	if err := writePID(cfg.PIDFile); err != nil {
 		return fmt.Errorf("write pid: %w", err)
 	}
 
@@ -548,14 +516,18 @@ func startConfigWatcher(
 
 /* ----------------- Stats helpers ----------------- */
 
-func loadDBAndConfig(leasePath, cfgPath string) (*dhcpserver.LeaseDB, config.Config, error) {
-	db := dhcpserver.NewLeaseDB(leasePath)
-	if err := db.Load(); err != nil {
-		return nil, config.Config{}, err
-	}
-	cfg, jerr := config.ParseStrict(cfgPath)
+func loadDBAndConfig(cfgPath string) (*dhcpserver.LeaseDB, config.Config, error) {
+	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
 		return nil, config.Config{}, jerr
+	}
+	cfg, _, verr := config.ValidateAndNormalizeConfig(raw)
+	if verr != nil {
+		return nil, config.Config{}, verr
+	}
+	db := dhcpserver.NewLeaseDB(cfg.LeaseDBPath)
+	if err := db.Load(); err != nil {
+		return nil, config.Config{}, err
 	}
 	return db, cfg, nil
 }
@@ -565,10 +537,7 @@ func loadDBAndConfig(leasePath, cfgPath string) (*dhcpserver.LeaseDB, config.Con
 func main() {
 	var (
 		cfgPath     string
-		leasePath   string
-		logPath     string
 		console     bool
-		pidPath     string
 		nocolour    bool
 		showVersion bool
 	)
@@ -586,13 +555,9 @@ func main() {
 	}
 	root.PersistentFlags().BoolVarP(&showVersion, "version", "", false, "Print version and exit")
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "", "dhcplane.json", "Path to JSON config")
-	root.PersistentFlags().StringVar(&leasePath, "lease-db", "leases.json", "Path to leases JSON DB")
 	// authoritative is now config-driven; flag removed
-	root.PersistentFlags().StringVar(&logPath, "log", "dhcplane.log", "Log file path")
 	root.PersistentFlags().BoolVar(&console, "console", false, "Export console over UNIX socket in addition to stdout/stderr logging")
-	root.PersistentFlags().StringVar(&pidPath, "pid-file", "dhcplane.pid", "PID file for reload control")
 	root.PersistentFlags().BoolVar(&nocolour, "nocolour", false, "Disable ANSI colours in console output")
-	root.PersistentFlags().BoolVar(&transparent, "transparent", false, "Use terminal background (no solid fill)")
 
 	// Inject the client-side attach command into this binary.
 	consoleui.InstallAttachCommand(root)
@@ -612,12 +577,7 @@ func main() {
 				return fmt.Errorf("config error: %w", jerr)
 			}
 
-			if transparent {
-				tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
-				tview.Styles.ContrastBackgroundColor = tcell.ColorDefault
-				tview.Styles.MoreContrastBackgroundColor = tcell.ColorDefault
-			}
-			return buildServerAndRun(cfgPath, leasePath, logPath, console, pidPath, nocolour)
+			return buildServerAndRun(cfgPath, console, nocolour)
 		},
 	}
 
@@ -627,8 +587,8 @@ func main() {
 		Use:   "leases",
 		Short: "Print current leases",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			db := dhcpserver.NewLeaseDB(leasePath)
-			if err := db.Load(); err != nil {
+			db, _, err := loadDBAndConfig(cfgPath)
+			if err != nil {
 				return err
 			}
 
@@ -682,7 +642,7 @@ func main() {
 		Use:   "stats",
 		Short: "Show allocation rates and lease status (add --details for a full table, --grid for a colour grid)",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			db, cfg, err := loadDBAndConfig(leasePath, cfgPath)
+			db, cfg, err := loadDBAndConfig(cfgPath)
 			if err != nil {
 				return err
 			}
@@ -773,11 +733,15 @@ func main() {
 		Short: "Signal a running server to reload the config (SIGHUP via PID file)",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			// Check file is valid before signaling
-			_, jerr := config.ParseStrict(cfgPath)
+			raw, jerr := config.ParseStrict(cfgPath)
 			if jerr != nil {
 				return fmt.Errorf("refusing to reload: config invalid: %w", jerr)
 			}
-			pid, err := readPID(pidPath)
+			cfg, _, verr := config.ValidateAndNormalizeConfig(raw)
+			if verr != nil {
+				return fmt.Errorf("refusing to reload: config invalid: %w", verr)
+			}
+			pid, err := readPID(cfg.PIDFile)
 			if err != nil {
 				return fmt.Errorf("read pid: %w", err)
 			}
@@ -813,9 +777,13 @@ func main() {
 				note = strings.TrimSpace(strings.Join(args[2:], " "))
 			}
 
-			cfg, jerr := config.ParseStrict(cfgPath)
+			rawCfg, jerr := config.ParseStrict(cfgPath)
 			if jerr != nil {
 				return jerr
+			}
+			cfg, _, verr := config.ValidateAndNormalizeConfig(rawCfg)
+			if verr != nil {
+				return verr
 			}
 			_, subnet := mustCIDR(cfg.SubnetCIDR)
 			if !subnet.Contains(ip) {
@@ -833,6 +801,7 @@ func main() {
 			}
 
 			// Conflict B: IP currently leased to a different MAC? (warn)
+			leasePath := cfg.LeaseDBPath
 			db := dhcpserver.NewLeaseDB(leasePath)
 			_ = db.Load()
 			if l, ok := db.FindByIP(ip.String()); ok && !macEqual(l.MAC, norm) {
@@ -906,9 +875,13 @@ func main() {
 			if err != nil {
 				return errf("invalid mac: %v", err)
 			}
-			cfg, jerr := config.ParseStrict(cfgPath)
+			rawCfg, jerr := config.ParseStrict(cfgPath)
 			if jerr != nil {
 				return jerr
+			}
+			cfg, _, verr := config.ValidateAndNormalizeConfig(rawCfg)
+			if verr != nil {
+				return verr
 			}
 			if cfg.Reservations == nil {
 				fmt.Println("Nothing to remove: no reservations")
@@ -960,7 +933,7 @@ func main() {
 				arpIface = cfg.Interface
 			}
 
-			entries, _, err := arp.ScanForCLI(cfg, leasePath, arpIface, arpAllIfaces, arpRefresh, time.Second*3)
+			entries, _, err := arp.ScanForCLI(cfg, cfg.LeaseDBPath, arpIface, arpAllIfaces, arpRefresh, time.Second*3)
 			if err != nil {
 				return err
 			}
@@ -1073,6 +1046,8 @@ func ensureDefaultConfig(cfgPath string) error {
 		"compact_on_load":          false,
 		"dns":                      []string{"192.168.1.1", "1.1.1.1"},
 		"domain":                   "lan",
+		"lease_db_path":            "leases.json",
+		"pid_file":                 "dhcplane.pid",
 		"authoritative":            true, // default authoritative if unset
 		"lease_seconds":            3600,
 		"lease_sticky_seconds":     3600,

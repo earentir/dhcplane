@@ -96,6 +96,8 @@ type Config struct {
 	CompactOnLoad bool     `json:"compact_on_load"`
 	DNS           []string `json:"dns"`
 	Domain        string   `json:"domain,omitempty"`
+	LeaseDBPath   string   `json:"lease_db_path,omitempty"`
+	PIDFile       string   `json:"pid_file,omitempty"`
 
 	// Authoritative mode: when true, server sends NAKs on invalid requests.
 	// Nil means "unset" and defaults to true.
@@ -450,22 +452,33 @@ func ValidateAndNormalizeConfig(cfg Config) (Config, []string, error) {
 	}
 
 	// Logging defaults and validation
-	if c.Logging.Path != "" || c.Logging.Filename != "" {
-		if c.Logging.MaxSize <= 0 {
-			c.Logging.MaxSize = 20
-		}
-		if c.Logging.MaxBackups < 0 {
-			return cfg, warns, fmt.Errorf("logging.max_backups must be >= 0")
-		}
-		if c.Logging.MaxBackups == 0 {
-			c.Logging.MaxBackups = 5
-		}
-		if c.Logging.MaxAge < 0 {
-			return cfg, warns, fmt.Errorf("logging.max_age must be >= 0")
-		}
-		if !c.Logging.Compress {
-			c.Logging.Compress = true
-		}
+	c.LeaseDBPath = strings.TrimSpace(c.LeaseDBPath)
+	if c.LeaseDBPath == "" {
+		c.LeaseDBPath = "leases.json"
+	}
+	c.PIDFile = strings.TrimSpace(c.PIDFile)
+	if c.PIDFile == "" {
+		c.PIDFile = "dhcplane.pid"
+	}
+	c.Logging.Path = strings.TrimSpace(c.Logging.Path)
+	c.Logging.Filename = strings.TrimSpace(c.Logging.Filename)
+	if c.Logging.Filename == "" {
+		c.Logging.Filename = "dhcplane.log"
+	}
+	if c.Logging.MaxSize <= 0 {
+		c.Logging.MaxSize = 20
+	}
+	if c.Logging.MaxBackups < 0 {
+		return cfg, warns, fmt.Errorf("logging.max_backups must be >= 0")
+	}
+	if c.Logging.MaxBackups == 0 {
+		c.Logging.MaxBackups = 5
+	}
+	if c.Logging.MaxAge < 0 {
+		return cfg, warns, fmt.Errorf("logging.max_age must be >= 0")
+	}
+	if !c.Logging.Compress {
+		c.Logging.Compress = true
 	}
 
 	// DetectDHCPServers: defaults, clamps, normalization, validation

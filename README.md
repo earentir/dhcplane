@@ -112,6 +112,8 @@ The server loads a strict JSON file (unknown fields are rejected). On `serve` st
   "compact_on_load": false,
   "dns": ["1.1.1.1", "9.9.9.9"],
   "domain": "lan",
+  "lease_db_path": "leases.json",
+  "pid_file": "dhcplane.pid",
   "lease_seconds": 86400,
   "lease_sticky_seconds": 86400,
   "auto_reload": true,
@@ -176,6 +178,8 @@ Defaults:
 - `lease_sticky_seconds`: `86400` (sticky window) if ≤ 0
 - At least one pool is required
 - Unknown fields are rejected (strict mode)
+- `lease_db_path`: defaults to `leases.json` when omitted
+- `pid_file`: defaults to `dhcplane.pid` when omitted
 
 ### Example config
 
@@ -320,8 +324,6 @@ Serve with console echo and file log:
 ```bash
 ./dhcplane serve \
   --config ./config.json \
-  --lease-db ./leases.json \
-  --log ./dhcplane.log \
   --console
 ```
 
@@ -334,26 +336,26 @@ Check the config:
 Live reload via PID file (default `dhcplane.pid`):
 
 ```bash
-./dhcplane reload -c ./config.json --pid-file dhcplane.pid
+./dhcplane reload -c ./config.json
 ```
 
 List current leases (pretty JSON):
 
 ```bash
-./dhcplane leases --lease-db ./leases.json
+./dhcplane leases -c ./config.json
 ```
 
 Stats & tables:
 
 ```bash
 # Summary + leased/expiring/expired tables
-./dhcplane stats -c ./config.json --lease-db ./leases.json
+./dhcplane stats -c ./config.json
 
 # Full subnet table (hides free addresses) with Type column
-./dhcplane stats -c ./config.json --lease-db ./leases.json --details
+./dhcplane stats -c ./config.json --details
 
 # colour grid of the whole subnet
-./dhcplane stats -c ./config.json --lease-db ./leases.json --grid
+./dhcplane stats -c ./config.json --grid
 ```
 
 Add or update a reservation:
@@ -411,7 +413,7 @@ Strictly validate `config.json`. Unknown fields, wrong types, etc., return preci
 
 ### `reload`
 
-Reads PID from `--pid-file` and sends `SIGHUP`. Before signaling, re-validates the config and refuses to reload if invalid.
+Reads PID from `pid_file` in the config and sends `SIGHUP`. Before signaling, re-validates the config and refuses to reload if invalid.
 
 ### `manage add/remove`
 
@@ -434,19 +436,16 @@ Global flags (apply to all commands unless noted):
 
 - `-c, --config string`
   Path to JSON config (default `config.json`)
-- `--lease-db string`
-  Path to leases DB (default `leases.json`)
-- `--log string`
-  Log file path (empty = console-only). Default `dhcplane.log`
 - `--console`
   Serve the interactive console over UNIX socket (logs always print to stdout/stderr)
-- `--pid-file string`
-  PID file path (default `dhcplane.pid`)
+- `--nocolour`
+  Disable ANSI colours in console output
 
 Command-specific flags:
 
 - `stats --details`
 - `stats --grid`
+- `console attach --transparent`
 
 ---
 
@@ -473,9 +472,9 @@ When `auto_reload` is true, the process also watches the config file’s directo
 
 ## Logging
 
-- File logger is created at `--log` path; logs are always mirrored to stdout/stderr.
+- File logger is created using the `logging` section (default `dhcplane.log`); logs are always mirrored to stdout/stderr.
 - Internal errors are additionally printed to stderr in red for operator visibility.
-- PID file is written at `--pid-file`.
+- PID file is written at the `pid_file` path in the config.
 
 Example log lines:
 
