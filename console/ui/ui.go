@@ -1,6 +1,5 @@
-// Package consoleui provides a generic console toolkit with a headless server broker
-// and an interactive tview client used by `dhcplane console attach`.
-package consoleui
+// Package ui provides a generic console toolkit used by `dhcplane console attach`.
+package ui
 
 import (
 	"bufio"
@@ -16,17 +15,9 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"github.com/spf13/cobra"
-)
 
-// Style defines a simple tview tag style: [FG:BG:ATTRS] ... [-:-:-]
-// FG/BG accept named colors ("red") or hex ("#ff3366"); empty keeps current.
-// Attrs is a compact string like "b", "bu", "i", "u", "d", "t".
-type Style struct {
-	FG    string
-	BG    string
-	Attrs string
-}
+	"dhcplane/console"
+)
 
 // Options defines options for the console UI.
 type Options struct {
@@ -36,6 +27,7 @@ type Options struct {
 	HelpExtra     []string
 	OnExit        func(code int)
 	DisableTopBar bool // false = show top bar (Title | Counters); true = legacy: no top bar
+	Rules         console.Config
 }
 
 type counterRule struct {
@@ -51,41 +43,8 @@ type highlightRule struct {
 	match         string
 	caseSensitive bool
 	// Either style or styler is used. If both are set, styler wins.
-	style  *Style
+	style  *console.Style
 	styler func(s string, noColour bool) string
-}
-
-// wireMeta is sent once to each newly attached client to transfer rules and limits.
-type wireMeta struct {
-	Type       string          `json:"type"` // "meta"
-	MaxLines   int             `json:"max_lines"`
-	Counters   []wireCounter   `json:"counters"`
-	Highlights []wireHighlight `json:"highlights"`
-}
-type wireCounter struct {
-	Match         string `json:"match"`
-	CaseSensitive bool   `json:"case_sensitive"`
-	Label         string `json:"label"`
-	WindowS       int    `json:"window_s"`
-}
-type wireHighlight struct {
-	Match         string `json:"match"`
-	CaseSensitive bool   `json:"case_sensitive"`
-	Style         *Style `json:"style,omitempty"`
-}
-
-// wireLine carries a single console line with its original timestamp and a coarse level.
-type wireLine struct {
-	Type  string `json:"type"`  // "line"
-	TsUs  int64  `json:"ts_us"` // original time on server (microseconds)
-	Text  string `json:"text"`  // exact line as appended
-	Level string `json:"level"` // "info" | "error"
-}
-
-// wireNotice informs a slow client that some lines were dropped locally.
-type wireNotice struct {
-	Type string `json:"type"` // "notice"
-	Text string `json:"text"`
 }
 
 // UI represents the interactive client UI.
@@ -125,12 +84,16 @@ type UI struct {
 
 // New creates a new console UI with the given options.
 func New(opts Options) *UI {
-	if opts.MaxLines <= 0 {
-		opts.MaxLines = 10000
+	effectiveMax := opts.MaxLines
+	if effectiveMax <= 0 {
+		effectiveMax = opts.Rules.EffectiveMaxLines()
+	}
+	if effectiveMax <= 0 {
+		effectiveMax = console.DefaultMaxLines
 	}
 	u := &UI{
-		lines:         make([]string, 0, opts.MaxLines),
-		maxLines:      opts.MaxLines,
+		lines:         make([]string, 0, effectiveMax),
+		maxLines:      effectiveMax,
 		mouseOn:       opts.MouseEnabled,
 		noColour:      opts.NoColour,
 		helpExtra:     append([]string(nil), opts.HelpExtra...),
@@ -195,13 +158,71 @@ func New(opts Options) *UI {
 	u.app.SetFocus(u.inputField)
 	u.setLogSeparators(false) // input focused
 
-	// Initial paint
-	if u.topBarEnabled {
-		u.updateTopBarDirect()
+	// Apply initial rules/config if provided.
+	if len(opts.Rules.Counters) > 0 || len(opts.Rules.Highlights) > 0 || opts.Rules.MaxLines > 0 {
+		u.ApplyConfig(opts.Rules)
+		if u.topBarEnabled {
+			u.updateTopBarDirect()
+		}
+		u.updateBottomBarDirect()
+	} else {
+		// Initial paint when no config update queued yet.
+		if u.topBarEnabled {
+			u.updateTopBarDirect()
+		}
+		u.updateBottomBarDirect()
 	}
-	u.updateBottomBarDirect()
 
 	return u
+}
+
+// ApplyConfig replaces current counters, highlights, and max-lines settings with cfg.
+func (u *UI) ApplyConfig(cfg console.Config) {
+	if cfg.MaxLines > 0 {
+		u.mu.Lock()
+		u.maxLines = cfg.MaxLines
+		if len(u.lines) > u.maxLines {
+			u.lines = append([]string(nil), u.lines[len(u.lines)-u.maxLines:]...)
+		}
+		u.mu.Unlock()
+	}
+
+	counterRules := make([]*counterRule, 0, len(cfg.Counters))
+	for _, spec := range cfg.Counters {
+		window := spec.WindowSeconds
+		if window <= 0 {
+			window = 60
+		}
+		counterRules = append(counterRules, &counterRule{
+			match:         spec.Match,
+			caseSensitive: spec.CaseSensitive,
+			label:         spec.Label,
+			window:        time.Duration(window) * time.Second,
+		})
+	}
+	u.counterMu.Lock()
+	u.counters = counterRules
+	u.counterMu.Unlock()
+
+	highlightRules := make([]*highlightRule, 0, len(cfg.Highlights))
+	for _, spec := range cfg.Highlights {
+		hr := &highlightRule{match: spec.Match, caseSensitive: spec.CaseSensitive}
+		if spec.Style != nil {
+			st := *spec.Style
+			hr.style = &st
+		}
+		highlightRules = append(highlightRules, hr)
+	}
+	u.hlMu.Lock()
+	u.highlights = highlightRules
+	u.hlMu.Unlock()
+
+	u.Do(func() {
+		if u.topBarEnabled {
+			u.updateTopBarDirect()
+		}
+		u.updateBottomBarDirect()
+	})
 }
 
 // SetTitle sets the title of the UI, shown in the help modal.
@@ -260,7 +281,7 @@ func (u *UI) Tick(label string) {
 // case sensitivity, and style. Each time a line is appended, all registered
 // highlight rules are applied in order (first-registered wins) to style matching
 // substrings. If no style is given (empty), the match is ignored.
-func (u *UI) HighlightMap(match string, caseSensitive bool, style Style) {
+func (u *UI) HighlightMap(match string, caseSensitive bool, style console.Style) {
 	u.hlMu.Lock()
 	defer u.hlMu.Unlock()
 	u.highlights = append(u.highlights, &highlightRule{
@@ -678,7 +699,7 @@ func (u *UI) styleLine(line string) string {
 	return out
 }
 
-func (u *UI) applyStyle(s string, st Style) string {
+func (u *UI) applyStyle(s string, st console.Style) string {
 	if u.noColour || s == "" {
 		return s
 	}
@@ -875,14 +896,6 @@ func visualLen(s string) int {
 	return n
 }
 
-// levelOf derives a coarse level from the line prefix.
-func levelOf(s string) string {
-	if strings.HasPrefix(s, "ERROR: ") {
-		return "error"
-	}
-	return "info"
-}
-
 // chooseSocketPathForDial picks the first existing socket path in the same order.
 // It only checks for presence and returns the first match.
 func chooseSocketPathForDial() (string, error) {
@@ -929,7 +942,6 @@ func Attach(opts AttachOptions) error {
 
 	u := New(Options{
 		NoColour:     opts.NoColour,
-		MaxLines:     10000, // will be adjusted on meta
 		MouseEnabled: true,
 	})
 	if opts.Transparent {
@@ -962,23 +974,16 @@ func Attach(opts AttachOptions) error {
 			}
 			switch typ.Type {
 			case "meta":
-				var m wireMeta
+				var m console.Meta
 				if json.Unmarshal(b, &m) == nil {
-					// update limits and rules locally
-					u.mu.Lock()
-					u.maxLines = m.MaxLines
-					u.mu.Unlock()
-					for _, c := range m.Counters {
-						u.RegisterCounter(c.Match, c.CaseSensitive, c.Label, c.WindowS)
-					}
-					for _, h := range m.Highlights {
-						if h.Style != nil {
-							u.HighlightMap(h.Match, h.CaseSensitive, *h.Style)
-						}
-					}
+					u.ApplyConfig(console.Config{
+						MaxLines:   m.MaxLines,
+						Counters:   append([]console.CounterSpec(nil), m.Counters...),
+						Highlights: append([]console.HighlightSpec(nil), m.Highlights...),
+					})
 				}
 			case "line":
-				var ev wireLine
+				var ev console.Line
 				if json.Unmarshal(b, &ev) == nil {
 					when := time.Unix(0, 0)
 					if ev.TsUs > 0 {
@@ -989,7 +994,7 @@ func Attach(opts AttachOptions) error {
 					u.appendWithWhen(when, ev.Text)
 				}
 			case "notice":
-				var n wireNotice
+				var n console.Notice
 				if json.Unmarshal(b, &n) == nil {
 					u.Append(n.Text)
 				}
@@ -999,34 +1004,4 @@ func Attach(opts AttachOptions) error {
 
 	// run local UI loop (blocks until exit)
 	return u.app.Run()
-}
-
-// ---- cobra integration (same binary client command) ----
-
-// InstallAttachCommand adds a "console attach" subcommand to the provided Cobra root.
-// Usage: dhcplane console attach [--socket PATH] [--transparent]
-func InstallAttachCommand(root *cobra.Command) {
-	var socket string
-	var transparent bool
-
-	consoleCmd := &cobra.Command{
-		Use:   "console",
-		Short: "Console-related commands",
-	}
-	attachCmd := &cobra.Command{
-		Use:   "attach",
-		Short: "Attach to the running console via UNIX socket",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return Attach(AttachOptions{
-				Socket:      socket,
-				Transparent: transparent,
-				Title:       "DHCPlane Console (attached)",
-			})
-		},
-	}
-	attachCmd.Flags().StringVar(&socket, "socket", "", "UNIX socket path override")
-	attachCmd.Flags().BoolVar(&transparent, "transparent", false, "Use terminal background")
-
-	consoleCmd.AddCommand(attachCmd)
-	root.AddCommand(consoleCmd)
 }

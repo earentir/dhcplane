@@ -3,7 +3,9 @@ package main
 import (
 	"dhcplane/arp"
 	"dhcplane/config"
-	"dhcplane/consoleui"
+	"dhcplane/console"
+	consolebroker "dhcplane/console/broker"
+	consoleui "dhcplane/console/ui"
 	"dhcplane/dhcpserver"
 	"dhcplane/statistics"
 	"encoding/json"
@@ -27,25 +29,37 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var appVersion = "0.1.41"
+var appVersion = "0.1.43"
+
+func buildConsoleConfig(maxLines int) console.Config {
+	if maxLines <= 0 {
+		maxLines = console.DefaultMaxLines
+	}
+	return console.Config{
+		MaxLines: maxLines,
+		Counters: []console.CounterSpec{
+			{Match: "REQUEST", CaseSensitive: false, Label: "RPM", WindowSeconds: 60},
+			{Match: "ACK", CaseSensitive: false, Label: "APM", WindowSeconds: 60},
+		},
+		Highlights: []console.HighlightSpec{
+			{Match: "BANNED-MAC", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
+			{Match: "NAK", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
+			{Match: "ACK", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
+			{Match: "OFFER", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
+			{Match: "REQUEST", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DISCOVER", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "RELEASE", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DECLINE", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DETECT", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
+			{Match: "FOREIGN-DHCP", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
+			{Match: "ARP-ANOMALY", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
+		},
+	}
+}
 
 // buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
-func buildConsoleBroker(maxLines int) *consoleui.Broker {
-	broker := consoleui.NewBroker(consoleui.BrokerOptions{MaxLines: maxLines})
-	broker.RegisterCounter("REQUEST", false, "RPM", 60)
-	broker.RegisterCounter("ACK", false, "APM", 60)
-	broker.HighlightMap("BANNED-MAC", true, consoleui.Style{FG: "red", Attrs: "b"})
-	broker.HighlightMap("NAK", true, consoleui.Style{FG: "red", Attrs: "b"})
-	broker.HighlightMap("ACK", true, consoleui.Style{FG: "green", Attrs: "b"})
-	broker.HighlightMap("OFFER", true, consoleui.Style{FG: "green", Attrs: "b"})
-	broker.HighlightMap("REQUEST", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	broker.HighlightMap("DISCOVER", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	broker.HighlightMap("RELEASE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	broker.HighlightMap("DECLINE", true, consoleui.Style{FG: "yellow", Attrs: "b"})
-	broker.HighlightMap("DETECT", true, consoleui.Style{FG: "green", Attrs: "b"})
-	broker.HighlightMap("FOREIGN-DHCP", true, consoleui.Style{FG: "red", Attrs: "b"})
-	broker.HighlightMap("ARP-ANOMALY", true, consoleui.Style{FG: "red", Attrs: "b"})
-	return broker
+func buildConsoleBroker(maxLines int) *consolebroker.Broker {
+	return consolebroker.New(consolebroker.Options{Config: buildConsoleConfig(maxLines)})
 }
 
 /* ----------------- Logging ----------------- */
@@ -114,7 +128,7 @@ func logDetect(cfg *config.Config, iface string, logSink func(string, ...any)) {
 }
 
 // buildServerAndRun starts the DHCP server and optional console broker, handles reloads and signals.
-func buildServerAndRun(cfgPath string, console bool) error {
+func buildServerAndRun(cfgPath string, enableConsole bool) error {
 	// Load + validate/normalize initial config
 	raw, jerr := config.ParseStrict(cfgPath)
 	if jerr != nil {
@@ -143,17 +157,17 @@ func buildServerAndRun(cfgPath string, console bool) error {
 	}()
 
 	// Optional console broker (exports console over UNIX socket)
-	var broker *consoleui.Broker
-	if console {
+	var consoleBroker *consolebroker.Broker
+	if enableConsole {
 		maxLines := cfg.ConsoleMaxLines
 		if maxLines <= 0 {
-			maxLines = 10000
+			maxLines = console.DefaultMaxLines
 		}
-		broker = buildConsoleBroker(maxLines)
-		if err := broker.Start(); err != nil {
+		consoleBroker = buildConsoleBroker(maxLines)
+		if err := consoleBroker.Start(); err != nil {
 			return fmt.Errorf("console broker: %w", err)
 		}
-		defer broker.Stop()
+		defer consoleBroker.Stop()
 	}
 
 	// Sinks
@@ -165,8 +179,8 @@ func buildServerAndRun(cfgPath string, console bool) error {
 
 		ts := time.Now().Format("2006/01/02 15:04:05.000000")
 
-		if broker != nil {
-			broker.Append(ts + " " + msg)
+		if consoleBroker != nil {
+			consoleBroker.Append(ts + " " + msg)
 		}
 
 		fmt.Fprintln(os.Stdout, msg)
@@ -177,8 +191,8 @@ func buildServerAndRun(cfgPath string, console bool) error {
 			lg.Printf("%s", msg)
 		}
 		ts := time.Now().Format("2006/01/02 15:04:05.000000")
-		if broker != nil {
-			broker.Append(ts + " " + msg)
+		if consoleBroker != nil {
+			consoleBroker.Append(ts + " " + msg)
 		}
 		fmt.Fprintln(os.Stderr, msg)
 	}
@@ -534,6 +548,33 @@ func loadDBAndConfig(cfgPath string) (*dhcpserver.LeaseDB, config.Config, error)
 
 /* ----------------- Cobra CLI ----------------- */
 
+func addConsoleCommands(root *cobra.Command) {
+	var socket string
+	var transparent bool
+
+	consoleCmd := &cobra.Command{
+		Use:   "console",
+		Short: "Console-related commands",
+	}
+
+	attachCmd := &cobra.Command{
+		Use:   "attach",
+		Short: "Attach to the running console via UNIX socket",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return consoleui.Attach(consoleui.AttachOptions{
+				Socket:      socket,
+				Transparent: transparent,
+				Title:       "DHCPlane Console (attached)",
+			})
+		},
+	}
+	attachCmd.Flags().StringVar(&socket, "socket", "", "UNIX socket path override")
+	attachCmd.Flags().BoolVar(&transparent, "transparent", false, "Use terminal background")
+
+	consoleCmd.AddCommand(attachCmd)
+	root.AddCommand(consoleCmd)
+}
+
 func main() {
 	var (
 		cfgPath     string
@@ -558,7 +599,7 @@ func main() {
 	root.PersistentFlags().BoolVar(&console, "console", false, "Export console over UNIX socket in addition to stdout/stderr logging")
 
 	// Inject the client-side attach command into this binary.
-	consoleui.InstallAttachCommand(root)
+	addConsoleCommands(root)
 
 	/* ---- serve ---- */
 	serveCmd := &cobra.Command{
