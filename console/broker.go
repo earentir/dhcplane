@@ -1,4 +1,4 @@
-package broker
+package console
 
 import (
 	"bufio"
@@ -9,16 +9,16 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"dhcplane/console"
 )
 
-type Options struct {
-	Config console.Config
+type BrokerOptions struct {
+	Config           Config
+	SocketCandidates []string
+	ListenerFactory  func() (string, net.Listener, error)
 }
 
 type Broker struct {
-	cfg      console.Config
+	cfg      Config
 	metaBuf  []byte
 	maxLines int
 
@@ -28,10 +28,12 @@ type Broker struct {
 	head     int
 	capacity int
 
-	stateMu    sync.Mutex
-	running    bool
-	listener   net.Listener
-	socketPath string
+	stateMu          sync.Mutex
+	running          bool
+	listener         net.Listener
+	socketPath       string
+	listenerFactory  func() (string, net.Listener, error)
+	socketCandidates []string
 }
 
 type client struct {
@@ -40,11 +42,11 @@ type client struct {
 	ch   chan []byte
 }
 
-func New(opts Options) *Broker {
-	cfg := console.Config{
+func NewBroker(opts BrokerOptions) *Broker {
+	cfg := Config{
 		MaxLines:   opts.Config.MaxLines,
-		Counters:   append([]console.CounterSpec(nil), opts.Config.Counters...),
-		Highlights: make([]console.HighlightSpec, 0, len(opts.Config.Highlights)),
+		Counters:   append([]CounterSpec(nil), opts.Config.Counters...),
+		Highlights: make([]HighlightSpec, 0, len(opts.Config.Highlights)),
 	}
 	for _, h := range opts.Config.Highlights {
 		cp := h
@@ -56,27 +58,40 @@ func New(opts Options) *Broker {
 	}
 
 	if cfg.MaxLines <= 0 {
-		cfg.MaxLines = console.DefaultMaxLines
+		cfg.MaxLines = DefaultMaxLines
 	}
 
-	meta := console.MakeMeta(cfg)
+	meta := MakeMeta(cfg)
 	metaBytes, _ := json.Marshal(meta)
 	metaBytes = append(metaBytes, '\n')
 
 	size := cfg.EffectiveMaxLines()
+	candidates := append([]string(nil), opts.SocketCandidates...)
 
 	return &Broker{
-		cfg:      cfg,
-		metaBuf:  metaBytes,
-		maxLines: size,
-		clients:  make(map[*client]struct{}),
-		ring:     make([][]byte, size),
-		capacity: size,
+		cfg:              cfg,
+		metaBuf:          metaBytes,
+		maxLines:         size,
+		clients:          make(map[*client]struct{}),
+		ring:             make([][]byte, size),
+		capacity:         size,
+		listenerFactory:  opts.ListenerFactory,
+		socketCandidates: candidates,
 	}
 }
 
 func (b *Broker) Start() error {
-	path, ln, err := listenFirstAvailable()
+	var (
+		path string
+		ln   net.Listener
+		err  error
+	)
+
+	if b.listenerFactory != nil {
+		path, ln, err = b.listenerFactory()
+	} else {
+		path, ln, err = listenFirstAvailable(b.socketCandidates)
+	}
 	if err != nil {
 		return err
 	}
@@ -141,7 +156,7 @@ func (b *Broker) Appendf(format string, args ...any) {
 }
 
 func (b *Broker) appendWithWhen(when time.Time, line string) {
-	ev := console.Line{Type: "line", TsUs: when.UnixMicro(), Text: line, Level: console.LevelOf(line)}
+	ev := Line{Type: "line", TsUs: when.UnixMicro(), Text: line, Level: LevelOf(line)}
 	buf, _ := json.Marshal(ev)
 	buf = append(buf, '\n')
 
@@ -219,7 +234,7 @@ func (b *Broker) broadcast(buf []byte) {
 			}
 			_ = b.trySend(cli, buf)
 			if dropped > 0 {
-				notice := console.Notice{Type: "notice", Text: fmt.Sprintf("[viewer lagged; dropped %d lines]", dropped)}
+				notice := Notice{Type: "notice", Text: fmt.Sprintf("[viewer lagged; dropped %d lines]", dropped)}
 				nb, _ := json.Marshal(notice)
 				nb = append(nb, '\n')
 				_ = b.trySend(cli, nb)
@@ -248,13 +263,9 @@ func (b *Broker) safeSend(cli *client, buf []byte) error {
 	}
 }
 
-func listenFirstAvailable() (string, net.Listener, error) {
-	candidates := []string{
-		"/run/dhcplane/consoleui.sock",
-		"/tmp/consoleui.sock",
-	}
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		candidates = append(candidates, filepath.Join(xdg, "dhcplane.sock"))
+func listenFirstAvailable(candidates []string) (string, net.Listener, error) {
+	if len(candidates) == 0 {
+		return "", nil, fmt.Errorf("console broker: no socket candidates provided")
 	}
 	for _, p := range candidates {
 		_ = os.MkdirAll(filepath.Dir(p), 0o755)

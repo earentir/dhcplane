@@ -1,5 +1,5 @@
-// Package ui provides a generic console toolkit used by `dhcplane console attach`.
-package ui
+// Package console provides a generic console toolkit used by `dhcplane console attach`.
+package console
 
 import (
 	"bufio"
@@ -8,26 +8,23 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-
-	"dhcplane/console"
 )
 
-// Options defines options for the console UI.
-type Options struct {
+// UIOptions defines options for the console UI.
+type UIOptions struct {
 	NoColour      bool
 	MaxLines      int
 	MouseEnabled  bool
 	HelpExtra     []string
 	OnExit        func(code int)
 	DisableTopBar bool // false = show top bar (Title | Counters); true = legacy: no top bar
-	Rules         console.Config
+	Rules         Config
 }
 
 type counterRule struct {
@@ -43,7 +40,7 @@ type highlightRule struct {
 	match         string
 	caseSensitive bool
 	// Either style or styler is used. If both are set, styler wins.
-	style  *console.Style
+	style  *Style
 	styler func(s string, noColour bool) string
 }
 
@@ -83,13 +80,13 @@ type UI struct {
 }
 
 // New creates a new console UI with the given options.
-func New(opts Options) *UI {
+func NewUI(opts UIOptions) *UI {
 	effectiveMax := opts.MaxLines
 	if effectiveMax <= 0 {
 		effectiveMax = opts.Rules.EffectiveMaxLines()
 	}
 	if effectiveMax <= 0 {
-		effectiveMax = console.DefaultMaxLines
+		effectiveMax = DefaultMaxLines
 	}
 	u := &UI{
 		lines:         make([]string, 0, effectiveMax),
@@ -101,15 +98,15 @@ func New(opts Options) *UI {
 	}
 
 	if opts.OnExit != nil {
-		u.onExit = opts.OnExit
+		u.onExit = func(code int) {
+			u.app.EnableMouse(false)
+			u.app.Stop()
+			opts.OnExit(code)
+		}
 	} else {
 		u.onExit = func(code int) {
 			u.app.EnableMouse(false)
 			u.app.Stop()
-			go func() {
-				time.Sleep(25 * time.Millisecond)
-				os.Exit(code)
-			}()
 		}
 	}
 
@@ -177,7 +174,7 @@ func New(opts Options) *UI {
 }
 
 // ApplyConfig replaces current counters, highlights, and max-lines settings with cfg.
-func (u *UI) ApplyConfig(cfg console.Config) {
+func (u *UI) ApplyConfig(cfg Config) {
 	if cfg.MaxLines > 0 {
 		u.mu.Lock()
 		u.maxLines = cfg.MaxLines
@@ -281,7 +278,7 @@ func (u *UI) Tick(label string) {
 // case sensitivity, and style. Each time a line is appended, all registered
 // highlight rules are applied in order (first-registered wins) to style matching
 // substrings. If no style is given (empty), the match is ignored.
-func (u *UI) HighlightMap(match string, caseSensitive bool, style console.Style) {
+func (u *UI) HighlightMap(match string, caseSensitive bool, style Style) {
 	u.hlMu.Lock()
 	defer u.hlMu.Unlock()
 	u.highlights = append(u.highlights, &highlightRule{
@@ -699,7 +696,7 @@ func (u *UI) styleLine(line string) string {
 	return out
 }
 
-func (u *UI) applyStyle(s string, st console.Style) string {
+func (u *UI) applyStyle(s string, st Style) string {
 	if u.noColour || s == "" {
 		return s
 	}
@@ -898,40 +895,52 @@ func visualLen(s string) int {
 
 // chooseSocketPathForDial picks the first existing socket path in the same order.
 // It only checks for presence and returns the first match.
-func chooseSocketPathForDial() (string, error) {
-	candidates := []string{
-		"/run/dhcplane/consoleui.sock",
-		"/tmp/consoleui.sock",
-	}
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		candidates = append(candidates, filepath.Join(xdg, "dhcplane.sock"))
+func chooseSocketPathForDial(candidates []string) (string, error) {
+	if len(candidates) == 0 {
+		return "", errors.New("console attach: no socket candidates provided")
 	}
 	for _, p := range candidates {
 		if fi, err := os.Stat(p); err == nil && (fi.Mode()&os.ModeSocket) != 0 {
 			return p, nil
 		}
 	}
-	return "", errors.New("console attach: UNIX socket not found in default locations")
+	return "", errors.New("console attach: socket not found in provided locations")
 }
 
 // ---- attach client ----
 
 // AttachOptions control how the client connects and renders.
 type AttachOptions struct {
-	Socket      string // optional override; if empty, auto-detect default path order
-	NoColour    bool
-	Transparent bool
-	Title       string // optional title override
+	Socket            string // optional override; if empty, auto-detect default path order
+	SocketCandidates  []string
+	SocketResolver    func() (string, error)
+	NoColour          bool
+	Transparent       bool
+	Title             string // optional title override
+	DisconnectMessage string
+	OnExit            func(int)
 }
 
 // Attach connects to the server socket and renders the full interactive UI locally.
 func Attach(opts AttachOptions) error {
-	path := opts.Socket
+	path := strings.TrimSpace(opts.Socket)
+	var err error
 	if path == "" {
-		var err error
-		path, err = chooseSocketPathForDial()
-		if err != nil {
-			return err
+		if opts.SocketResolver != nil {
+			path, err = opts.SocketResolver()
+			if err != nil {
+				return err
+			}
+			path = strings.TrimSpace(path)
+		}
+		if path == "" && len(opts.SocketCandidates) > 0 {
+			path, err = chooseSocketPathForDial(opts.SocketCandidates)
+			if err != nil {
+				return err
+			}
+		}
+		if path == "" {
+			return errors.New("console attach: socket path not resolved")
 		}
 	}
 	conn, err := net.Dial("unix", path)
@@ -940,10 +949,14 @@ func Attach(opts AttachOptions) error {
 	}
 	defer conn.Close()
 
-	u := New(Options{
+	uiOpts := UIOptions{
 		NoColour:     opts.NoColour,
 		MouseEnabled: true,
-	})
+	}
+	if opts.OnExit != nil {
+		uiOpts.OnExit = opts.OnExit
+	}
+	u := NewUI(uiOpts)
 	if opts.Transparent {
 		tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
 		tview.Styles.ContrastBackgroundColor = tcell.ColorDefault
@@ -952,7 +965,11 @@ func Attach(opts AttachOptions) error {
 	if opts.Title != "" {
 		u.SetTitle(opts.Title)
 	} else {
-		u.SetTitle("DHCPlane Console (attached)")
+		u.SetTitle("Console (attached)")
+	}
+	disconnectNotice := opts.DisconnectMessage
+	if strings.TrimSpace(disconnectNotice) == "" {
+		disconnectNotice = "[notice] disconnected from server"
 	}
 
 	// reader goroutine: consume NDJSON from server and feed the local UI
@@ -961,7 +978,7 @@ func Attach(opts AttachOptions) error {
 		for {
 			b, err := r.ReadBytes('\n')
 			if err != nil {
-				u.Append("[notice] disconnected from server")
+				u.Append(disconnectNotice)
 				u.onExit(1)
 				return
 			}
@@ -974,16 +991,16 @@ func Attach(opts AttachOptions) error {
 			}
 			switch typ.Type {
 			case "meta":
-				var m console.Meta
+				var m Meta
 				if json.Unmarshal(b, &m) == nil {
-					u.ApplyConfig(console.Config{
+					u.ApplyConfig(Config{
 						MaxLines:   m.MaxLines,
-						Counters:   append([]console.CounterSpec(nil), m.Counters...),
-						Highlights: append([]console.HighlightSpec(nil), m.Highlights...),
+						Counters:   append([]CounterSpec(nil), m.Counters...),
+						Highlights: append([]HighlightSpec(nil), m.Highlights...),
 					})
 				}
 			case "line":
-				var ev console.Line
+				var ev Line
 				if json.Unmarshal(b, &ev) == nil {
 					when := time.Unix(0, 0)
 					if ev.TsUs > 0 {
@@ -994,7 +1011,7 @@ func Attach(opts AttachOptions) error {
 					u.appendWithWhen(when, ev.Text)
 				}
 			case "notice":
-				var n console.Notice
+				var n Notice
 				if json.Unmarshal(b, &n) == nil {
 					u.Append(n.Text)
 				}

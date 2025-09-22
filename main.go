@@ -4,8 +4,6 @@ import (
 	"dhcplane/arp"
 	"dhcplane/config"
 	"dhcplane/console"
-	consolebroker "dhcplane/console/broker"
-	consoleui "dhcplane/console/ui"
 	"dhcplane/dhcpserver"
 	"dhcplane/statistics"
 	"encoding/json"
@@ -57,9 +55,23 @@ func buildConsoleConfig(maxLines int) console.Config {
 	}
 }
 
+func consoleSocketCandidates() []string {
+	candidates := []string{
+		"/run/dhcplane/consoleui.sock",
+		"/tmp/consoleui.sock",
+	}
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, "dhcplane.sock"))
+	}
+	return candidates
+}
+
 // buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
-func buildConsoleBroker(maxLines int) *consolebroker.Broker {
-	return consolebroker.New(consolebroker.Options{Config: buildConsoleConfig(maxLines)})
+func buildConsoleBroker(maxLines int) *console.Broker {
+	return console.NewBroker(console.BrokerOptions{
+		Config:           buildConsoleConfig(maxLines),
+		SocketCandidates: consoleSocketCandidates(),
+	})
 }
 
 /* ----------------- Logging ----------------- */
@@ -157,7 +169,7 @@ func buildServerAndRun(cfgPath string, enableConsole bool) error {
 	}()
 
 	// Optional console broker (exports console over UNIX socket)
-	var consoleBroker *consolebroker.Broker
+	var consoleBroker *console.Broker
 	if enableConsole {
 		maxLines := cfg.ConsoleMaxLines
 		if maxLines <= 0 {
@@ -561,10 +573,18 @@ func addConsoleCommands(root *cobra.Command) {
 		Use:   "attach",
 		Short: "Attach to the running console via UNIX socket",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return consoleui.Attach(consoleui.AttachOptions{
-				Socket:      socket,
-				Transparent: transparent,
-				Title:       "DHCPlane Console (attached)",
+			return console.Attach(console.AttachOptions{
+				Socket:            socket,
+				SocketCandidates:  consoleSocketCandidates(),
+				Transparent:       transparent,
+				Title:             "DHCPlane Console (attached)",
+				DisconnectMessage: "[notice] disconnected from server",
+				OnExit: func(code int) {
+					go func() {
+						time.Sleep(25 * time.Millisecond)
+						os.Exit(code)
+					}()
+				},
 			})
 		},
 	}
