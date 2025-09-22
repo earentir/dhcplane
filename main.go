@@ -3,11 +3,11 @@ package main
 import (
 	"dhcplane/arp"
 	"dhcplane/config"
-	"dhcplane/console"
 	"dhcplane/dhcpserver"
 	"dhcplane/statistics"
 	"encoding/json"
 	"fmt"
+	planeconsole "github.com/network-plane/planeconsole"
 	"io"
 	"log"
 	"net"
@@ -29,28 +29,28 @@ import (
 
 var appVersion = "0.1.43"
 
-func buildConsoleConfig(maxLines int) console.Config {
+func buildConsoleConfig(maxLines int) planeconsole.Config {
 	if maxLines <= 0 {
-		maxLines = console.DefaultMaxLines
+		maxLines = planeconsole.DefaultMaxLines
 	}
-	return console.Config{
+	return planeconsole.Config{
 		MaxLines: maxLines,
-		Counters: []console.CounterSpec{
+		Counters: []planeconsole.CounterSpec{
 			{Match: "REQUEST", CaseSensitive: false, Label: "RPM", WindowSeconds: 60},
 			{Match: "ACK", CaseSensitive: false, Label: "APM", WindowSeconds: 60},
 		},
-		Highlights: []console.HighlightSpec{
-			{Match: "BANNED-MAC", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
-			{Match: "NAK", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
-			{Match: "ACK", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
-			{Match: "OFFER", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
-			{Match: "REQUEST", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
-			{Match: "DISCOVER", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
-			{Match: "RELEASE", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
-			{Match: "DECLINE", CaseSensitive: true, Style: &console.Style{FG: "yellow", Attrs: "b"}},
-			{Match: "DETECT", CaseSensitive: true, Style: &console.Style{FG: "green", Attrs: "b"}},
-			{Match: "FOREIGN-DHCP", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
-			{Match: "ARP-ANOMALY", CaseSensitive: true, Style: &console.Style{FG: "red", Attrs: "b"}},
+		Highlights: []planeconsole.HighlightSpec{
+			{Match: "BANNED-MAC", CaseSensitive: true, Style: &planeconsole.Style{FG: "red", Attrs: "b"}},
+			{Match: "NAK", CaseSensitive: true, Style: &planeconsole.Style{FG: "red", Attrs: "b"}},
+			{Match: "ACK", CaseSensitive: true, Style: &planeconsole.Style{FG: "green", Attrs: "b"}},
+			{Match: "OFFER", CaseSensitive: true, Style: &planeconsole.Style{FG: "green", Attrs: "b"}},
+			{Match: "REQUEST", CaseSensitive: true, Style: &planeconsole.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DISCOVER", CaseSensitive: true, Style: &planeconsole.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "RELEASE", CaseSensitive: true, Style: &planeconsole.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DECLINE", CaseSensitive: true, Style: &planeconsole.Style{FG: "yellow", Attrs: "b"}},
+			{Match: "DETECT", CaseSensitive: true, Style: &planeconsole.Style{FG: "green", Attrs: "b"}},
+			{Match: "FOREIGN-DHCP", CaseSensitive: true, Style: &planeconsole.Style{FG: "red", Attrs: "b"}},
+			{Match: "ARP-ANOMALY", CaseSensitive: true, Style: &planeconsole.Style{FG: "red", Attrs: "b"}},
 		},
 	}
 }
@@ -67,8 +67,9 @@ func consoleSocketCandidates() []string {
 }
 
 // buildConsoleBroker wires the generic console broker with our DHCP-specific counters and highlights.
-func buildConsoleBroker(maxLines int) *console.Broker {
-	return console.NewBroker(console.BrokerOptions{
+
+func buildConsoleBroker(maxLines int) *planeconsole.Broker {
+	return planeconsole.NewBroker(planeconsole.BrokerOptions{
 		Config:           buildConsoleConfig(maxLines),
 		SocketCandidates: consoleSocketCandidates(),
 	})
@@ -169,11 +170,11 @@ func buildServerAndRun(cfgPath string, enableConsole bool) error {
 	}()
 
 	// Optional console broker (exports console over UNIX socket)
-	var consoleBroker *console.Broker
+	var consoleBroker *planeconsole.Broker
 	if enableConsole {
 		maxLines := cfg.ConsoleMaxLines
 		if maxLines <= 0 {
-			maxLines = console.DefaultMaxLines
+			maxLines = planeconsole.DefaultMaxLines
 		}
 		consoleBroker = buildConsoleBroker(maxLines)
 		if err := consoleBroker.Start(); err != nil {
@@ -573,7 +574,7 @@ func addConsoleCommands(root *cobra.Command) {
 		Use:   "attach",
 		Short: "Attach to the running console via UNIX socket",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return console.Attach(console.AttachOptions{
+			return planeconsole.Attach(planeconsole.AttachOptions{
 				Socket:            socket,
 				SocketCandidates:  consoleSocketCandidates(),
 				Transparent:       transparent,
