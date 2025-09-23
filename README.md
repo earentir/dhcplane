@@ -1,4 +1,5 @@
 # dhcplane
+![dhcplane](https://github.com/user-attachments/assets/9ce25e91-fa42-427c-bfe3-c76e0b3198c1)
 
 A fast, single-binary **DHCPv4 server** written in Go (built on `insomniacslk/dhcp`) with:
 
